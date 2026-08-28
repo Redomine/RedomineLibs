@@ -1,0 +1,14 @@
+title:
+  ru: Параметры для электриков
+  en_us: Parameters for EOM
+
+tooltip:
+  ru: Добавляет параметры, задействованные в работе mySchema.
+  en_us: Adds parameters involved in the operation of mySchema.
+
+author: Redomine
+help_url: "https://kb.a101.ru/pages/viewpage.action?pageId=110560971"
+
+min_revit_version: 2020
+max_revit_version: 2024
+

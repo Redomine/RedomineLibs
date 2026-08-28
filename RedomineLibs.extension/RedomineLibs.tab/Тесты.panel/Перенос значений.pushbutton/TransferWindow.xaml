@@ -1,0 +1,105 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Перенос значений"
+        Width="440"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner"
+        Background="#FFFDFDFD"
+        FontFamily="Segoe UI"
+        FontSize="12">
+    <Window.Resources>
+        <Style TargetType="ComboBox">
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Padding" Value="7,3" />
+            <Setter Property="MaxDropDownHeight" Value="260" />
+            <Setter Property="IsTextSearchEnabled" Value="True" />
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="MinWidth" Value="92" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Padding" Value="12,3" />
+        </Style>
+        <Style x:Key="PrimaryButton"
+               TargetType="Button"
+               BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#FF176B63" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="BorderBrush" Value="#FF12564F" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Margin="0,0,0,6"
+                   FontWeight="SemiBold"
+                   Text="Исходный параметр" />
+        <ComboBox x:Name="source_combo"
+                  Grid.Row="1"
+                  SelectionChanged="selection_changed" />
+        <TextBlock x:Name="source_details"
+                   Grid.Row="2"
+                   MinHeight="18"
+                   Margin="2,4,0,0"
+                   Foreground="#FF666666"
+                   TextTrimming="CharacterEllipsis" />
+
+        <Border Grid.Row="3"
+                Height="1"
+                Margin="0,12"
+                Background="#FFE2E2E2" />
+
+        <TextBlock Grid.Row="4"
+                   Margin="0,0,0,6"
+                   FontWeight="SemiBold"
+                   Text="Целевой параметр" />
+        <ComboBox x:Name="target_combo"
+                  Grid.Row="5"
+                  SelectionChanged="selection_changed" />
+        <TextBlock x:Name="target_details"
+                   Grid.Row="6"
+                   MinHeight="18"
+                   Margin="2,4,0,0"
+                   Foreground="#FF666666"
+                   TextTrimming="CharacterEllipsis" />
+
+        <Grid Grid.Row="7" Margin="0,14,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBlock x:Name="validation_text"
+                       Grid.Row="0"
+                       MinHeight="18"
+                       Margin="0,0,0,8"
+                       Foreground="#FFB42318"
+                       TextWrapping="Wrap" />
+            <StackPanel Grid.Row="1"
+                        HorizontalAlignment="Right"
+                        Orientation="Horizontal">
+                <Button Margin="0,0,8,0"
+                        Click="cancel"
+                        Content="Отмена"
+                        IsCancel="True" />
+                <Button x:Name="transfer_button"
+                        Click="accept"
+                        Content="Перенести"
+                        IsDefault="True"
+                        Style="{StaticResource PrimaryButton}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

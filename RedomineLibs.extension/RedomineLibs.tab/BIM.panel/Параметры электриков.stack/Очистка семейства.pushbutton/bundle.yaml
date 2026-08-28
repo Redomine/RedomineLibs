@@ -1,0 +1,14 @@
+title:
+  ru: Очиска семейства
+  en_us: Clear the family
+
+tooltip:
+  ru: Очищает семейство от параметров задействованных в mySchema.
+  en_us: Clears the family of parameters involved in mySchema
+
+author: Redomine
+help_url: "https://kb.a101.ru/pages/viewpage.action?pageId=110560971"
+
+min_revit_version: 2020
+max_revit_version: 2024
+

@@ -1,0 +1,13 @@
+{
+    "allow_diagonal_transitions": true, 
+    "auto_exclude_unavailable_features": true, 
+    "boundary_offset_mm": 75.0, 
+    "clipper_scale": 1000000.0, 
+    "create_mode": "model", 
+    "max_loop_length_m": 100.0, 
+    "max_offset_levels": 200, 
+    "min_bend_radius_mm": 80.0, 
+    "show_diagnostics": true, 
+    "step_mm": 150.0, 
+    "tolerance_mm": 2.0
+}

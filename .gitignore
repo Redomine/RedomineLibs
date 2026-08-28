@@ -1,0 +1,13 @@
+# Local tests
+/tests/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# IDE state
+.idea/
+
+# Windows metadata
+Thumbs.db
+Desktop.ini

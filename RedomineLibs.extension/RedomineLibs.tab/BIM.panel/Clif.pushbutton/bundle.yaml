@@ -1,0 +1,10 @@
+title:
+  ru: Clif
+tooltip:
+  ru: >-
+    Для семейств из C:\Users\Mankaev_r\Downloads\Clif заполняет пустую
+    формулу ADSK_Марка формулой ADSK_Наименование соответствующего семейства
+    из подпапки «Исходники».
+author: Codex
+context: zero-doc
+min_revit_version: 2020
