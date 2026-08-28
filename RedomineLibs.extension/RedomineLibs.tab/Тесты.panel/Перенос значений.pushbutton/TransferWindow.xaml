@@ -41,6 +41,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0"
@@ -76,7 +77,14 @@
                    Foreground="#FF666666"
                    TextTrimming="CharacterEllipsis" />
 
-        <Grid Grid.Row="7" Margin="0,14,0,0">
+        <CheckBox x:Name="no_unfold_checkbox"
+                  Grid.Row="7"
+                  Margin="2,12,0,0"
+                  VerticalContentAlignment="Center"
+                  Content="Не раскрывать спецификацию (копировать из строк таблицы)"
+                  ToolTip="Копирует значение расчетного параметра из текущего (свернутого) вида спецификации во все элементы" />
+
+        <Grid Grid.Row="8" Margin="0,14,0,0">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
