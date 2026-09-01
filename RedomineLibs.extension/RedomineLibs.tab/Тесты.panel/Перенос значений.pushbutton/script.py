@@ -29,17 +29,20 @@ import dosymep
 clr.ImportExtensions(dosymep.Revit)
 clr.ImportExtensions(dosymep.Bim4Everyone)
 from dosymep.Bim4Everyone.Templates import ProjectParameters
+from dosymep.Bim4Everyone.SharedParams import SharedParamsConfig
 from dosymep.Revit import ParamExtensions
 import Autodesk
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI import *
 
 
-__title__ = 'Перенос значений(Old)'
+__title__ = 'Перенос значений'
 __doc__ = "Переносит между собой значения параметров в активной спецификации"
 
 COMMAND_DIR = os.path.dirname(__file__)
 XAML_FILE = os.path.join(COMMAND_DIR, "TransferWindow.xaml")
+POSITION_PARAM_NAME = u'ФОП_ВИС_Позиция'
+POSITION_PARAM_GUID = Guid('3f809907-b64c-4a8d-be5e-06709ee28386')
 
 
 class paramCell:
@@ -58,6 +61,78 @@ class projectParam:
 
 
 report_rows = set()
+created_position_param_id = None
+
+
+def get_position_parameter_element():
+    for param_element in FilteredElementCollector(doc).OfClass(SharedParameterElement):
+        try:
+            if param_element.GuidValue == POSITION_PARAM_GUID:
+                return param_element
+        except:
+            pass
+    return None
+
+
+def ensure_position_parameter():
+    global created_position_param_id
+
+    param_element = get_position_parameter_element()
+    if param_element:
+        return param_element
+
+    shared_params = SharedParamsConfig.Instance
+    if shared_params is None:
+        raise Exception(u'Конфигурация общих параметров dosymep не загружена')
+
+    ProjectParameters.Create(doc.Application).SetupRevitParam(
+        doc,
+        shared_params.VISPosition
+    )
+
+    param_element = get_position_parameter_element()
+    if not param_element:
+        raise Exception(
+            u'Не удалось создать параметр {0} из шаблона dosymep'.format(
+                POSITION_PARAM_NAME
+            )
+        )
+
+    created_position_param_id = param_element.Id
+    return param_element
+
+
+def ensure_position_schedule_field(definition, param_element):
+    for field_id in definition.GetFieldOrder():
+        schedule_field = definition.GetField(field_id)
+        try:
+            if schedule_field.ParameterId == param_element.Id:
+                return field_id, False
+        except:
+            pass
+
+    for schedulable_field in definition.GetSchedulableFields():
+        if schedulable_field.ParameterId == param_element.Id:
+            schedule_field = definition.AddField(schedulable_field)
+            return schedule_field.FieldId, True
+
+    raise Exception(
+        u'Параметр {0} нельзя добавить в эту спецификацию'.format(
+            POSITION_PARAM_NAME
+        )
+    )
+
+
+def remove_created_position_parameter():
+    global created_position_param_id
+    if created_position_param_id is None:
+        return
+
+    param_id = created_position_param_id
+    created_position_param_id = None
+    with revit.Transaction(u'Удаление временного параметра'):
+        if doc.GetElement(param_id):
+            doc.Delete(param_id)
 
 
 def make_col(category):
@@ -79,7 +154,7 @@ def get_duct_area(element):
 
 def getParaInd(paraName, definition):
     sortGroupInd = []
-    paraIndex = 0
+    paraIndex = None
     paraType = None
     index = 0
 
@@ -105,11 +180,11 @@ def getParaInd(paraName, definition):
                 sortGroupInd = index
         index += 1
 
-    try:
-        param = paramCell(paraIndex, sortGroupInd, paraName)
-        param.unitType = paraType
-    except Exception as e:
-        sys.exit()
+    if paraIndex is None:
+        raise Exception(u'Параметр {0} не обнаружен в спецификации'.format(paraName))
+
+    param = paramCell(paraIndex, sortGroupInd, paraName)
+    param.unitType = paraType
     return param
 
 
@@ -346,6 +421,64 @@ def get_cell_value(view_schedule, row, col_index, first_row=0):
             pass
 
     return ""
+
+
+def get_sort_column_indexes(definition):
+    field_order = list(definition.GetFieldOrder())
+    indexes = []
+    for sort_field in definition.GetSortGroupFields():
+        try:
+            indexes.append(field_order.index(sort_field.FieldId))
+        except:
+            pass
+    return indexes
+
+
+def normalize_group_cell(value):
+    return str(value or '').strip().lower()
+
+
+def get_group_row_key(view_schedule, row, sort_indexes):
+    return tuple(
+        normalize_group_cell(get_cell_value(view_schedule, row, col_index))
+        for col_index in sort_indexes
+    )
+
+
+def capture_grouped_values(view_schedule, definition, source_col_index):
+    sort_indexes = get_sort_column_indexes(definition)
+    data_rows = get_schedule_data_rows(view_schedule, definition, 0)
+    values = {}
+    fallback_found = False
+    fallback_value = None
+
+    for row in data_rows:
+        source_value = get_cell_value(view_schedule, row, source_col_index)
+        if sort_indexes:
+            key = get_group_row_key(view_schedule, row, sort_indexes)
+            if any(key):
+                values[key] = source_value
+        else:
+            fallback_found = True
+            fallback_value = source_value
+
+    return {
+        'sort_indexes': sort_indexes,
+        'values': values,
+        'fallback_found': fallback_found,
+        'fallback_value': fallback_value
+    }
+
+
+def get_grouped_value(snapshot, view_schedule, row):
+    sort_indexes = snapshot['sort_indexes']
+    if not sort_indexes:
+        return snapshot['fallback_found'], snapshot['fallback_value']
+
+    key = get_group_row_key(view_schedule, row, sort_indexes)
+    if key in snapshot['values']:
+        return True, snapshot['values'][key]
+    return False, None
 
 
 def get_schedule_data_rows(view_schedule, definition, elements_count=0):
@@ -594,21 +727,29 @@ def execute():
     else:
         return
 
+    position_param_element = ensure_position_parameter()
     errorList = []
+    grouped_values = None
 
     with revit.Transaction("Перенос параметров"):
         rollback_itemized = False
         rollback_header = False
+        position_params = []
+        position_field_id = None
+        position_field_created = False
 
-        if not no_unfold:
-            # если заголовки показаны изначально или если спека изначально развернута - сворачивать назад не нужно
-            if definition.IsItemized == False:
-                rollback_itemized = True
-            definition.IsItemized = True
+        # Уникальный ID можно прочитать по строкам только в развернутой спецификации.
+        if definition.IsItemized == False:
+            rollback_itemized = True
 
-            if definition.ShowHeaders == False:
-                rollback_header = True
-            definition.ShowHeaders = True
+        if definition.ShowHeaders == False:
+            rollback_header = True
+        definition.ShowHeaders = True
+
+        position_field_id, position_field_created = ensure_position_schedule_field(
+            definition,
+            position_param_element
+        )
 
         hidden = []
         i = 0
@@ -620,17 +761,57 @@ def execute():
 
         try:
             doc.Regenerate()
-        except Exception as e:
-            pass
+            paraObj = getParaInd(startParamName, definition)
+            if no_unfold:
+                grouped_values = capture_grouped_values(
+                    vs,
+                    definition,
+                    paraObj.index
+                )
 
-        try:
+            definition.IsItemized = True
+
+            for element in elementsOnView:
+                position_param = element.get_Parameter(POSITION_PARAM_GUID)
+                if not position_param or position_param.IsReadOnly:
+                    raise Exception(
+                        u'Параметр {0} отсутствует или недоступен для записи у элемента ID {1}'.format(
+                            POSITION_PARAM_NAME,
+                            element.Id.IntegerValue if hasattr(element.Id, 'IntegerValue') else element.Id.Value
+                        )
+                    )
+                position_param.Set(str(
+                    element.Id.IntegerValue if hasattr(element.Id, 'IntegerValue') else element.Id.Value
+                ))
+                position_params.append(position_param)
+
+            doc.Regenerate()
+
             paraObj = getParaInd(startParamName, definition)
             endParaObj = getParaInd(endParamName, definition)
+            posParaObj = getParaInd(POSITION_PARAM_NAME, definition)
 
-            expected_count = len(elementsOnView) if not no_unfold else 0
-            data_rows = get_schedule_data_rows(vs, definition, expected_count)
+            body_section = vs.GetTableData().GetSectionData(SectionType.Body)
+            data_rows = range(body_section.FirstRowNumber, body_section.LastRowNumber + 1)
+            schedule_elements = []
+            for sched_row in data_rows:
+                element_id_text = get_cell_value(vs, sched_row, posParaObj.index)
+                try:
+                    element_id = int(str(element_id_text).strip())
+                    schedule_element = doc.GetElement(ElementId(element_id))
+                except:
+                    continue
+                if schedule_element:
+                    schedule_elements.append((sched_row, schedule_element))
 
-            for idx, sheduleElement in enumerate(elementsOnView):
+            if not schedule_elements:
+                raise Exception(
+                    u'Не удалось сопоставить строки спецификации по параметру {0}. '
+                    u'Добавьте этот параметр в спецификацию.'.format(POSITION_PARAM_NAME)
+                )
+
+            for idx, row_element in enumerate(schedule_elements):
+                sched_row, sheduleElement = row_element
                 try:
                     elem_id_val = sheduleElement.Id.IntegerValue if hasattr(sheduleElement.Id, 'IntegerValue') else sheduleElement.Id.Value
                 except:
@@ -642,59 +823,18 @@ def execute():
                 startParamValue = None
 
                 if no_unfold:
-                    # В режиме "без раскрытия": читаем напрямую из ячейки свернутой спецификации
-                    sched_row = find_schedule_row_for_element(vs, definition, data_rows, sheduleElement, idx, paraObj.index)
-                    if sched_row is not None:
-                        cell_val = get_cell_value(vs, sched_row, paraObj.index)
-                        if cell_val is not None and cell_val != "":
-                            startParamValue = cell_val
-
-                    # Если в выбранной ячейке пусто, пробуем найти непустое значение в других строках data_rows
-                    if (startParamValue is None or startParamValue == "") and data_rows:
-                        for r_candidate in data_rows:
-                            c_val = get_cell_value(vs, r_candidate, paraObj.index)
-                            if c_val is not None and c_val != "":
-                                startParamValue = c_val
-                                break
-
-                    # Если в ячейке пусто, пробуем параметры элемента
-                    if startParamValue is None or startParamValue == "":
-                        try:
-                            startParamValue = sheduleElement.GetParamValue(startParamName)
-                        except Exception as e:
-                            startParamValue = None
-
-                        if startParamValue is None or startParamValue == "":
-                            p_src = sheduleElement.LookupParameter(startParamName)
-                            if not p_src:
-                                try:
-                                    type_id = sheduleElement.GetTypeId()
-                                    if type_id and type_id != ElementId.InvalidElementId:
-                                        elem_type = doc.GetElement(type_id)
-                                        if elem_type:
-                                            p_src = elem_type.LookupParameter(startParamName)
-                                except Exception as e:
-                                    pass
-                            if p_src:
-                                try:
-                                    src_storage = str(p_src.StorageType)
-                                    if src_storage == 'Double':
-                                        startParamValue = p_src.AsDouble()
-                                    elif src_storage == 'Integer':
-                                        startParamValue = p_src.AsInteger()
-                                    elif src_storage == 'String':
-                                        startParamValue = p_src.AsString()
-                                    elif src_storage == 'ElementId':
-                                        startParamValue = p_src.AsElementId()
-                                except Exception as e:
-                                    pass
-
-                        if startParamValue is not None and startParamValue != "" and paraObj.unitType is not None:
-                            try:
-                                converted = UnitUtils.ConvertFromInternalUnits(startParamValue, paraObj.unitType)
-                                startParamValue = converted
-                            except Exception as e:
-                                pass
+                    value_found, startParamValue = get_grouped_value(
+                        grouped_values,
+                        vs,
+                        sched_row
+                    )
+                    if not value_found:
+                        errorList.append(
+                            u'Не найдена исходная строка свернутой спецификации для ID {0}'.format(
+                                elem_id_val
+                            )
+                        )
+                        continue
                 else:
                     # Стандартный режим с раскрытием
                     # 1. Сначала пробуем получить значение напрямую из параметра модели
@@ -737,12 +877,10 @@ def execute():
                             pass
 
                     # 2. ЕСЛИ ЗНАЧЕНИЕ НЕ НАЙДЕНО В ПАРАМЕТРАХ МОДЕЛИ: Читаем из расчетной ячейки спецификации!
-                    if startParamValue is None:
-                        if idx < len(data_rows):
-                            sched_row = data_rows[idx]
-                            cell_val = get_cell_value(vs, sched_row, paraObj.index)
-                            if cell_val is not None and cell_val != "":
-                                startParamValue = cell_val
+                    if startParamValue is None or startParamValue == "":
+                        cell_val = get_cell_value(vs, sched_row, paraObj.index)
+                        if cell_val is not None and cell_val != "":
+                            startParamValue = cell_val
 
                 targetParam = sheduleElement.LookupParameter(endParamName)
                 if not targetParam:
@@ -810,6 +948,16 @@ def execute():
                     errorList.append("Ошибка записи для ID {0}: {1}".format(elem_id_val, e))
 
         finally:
+            for position_param in position_params:
+                try:
+                    position_param.Set('')
+                except Exception as cleanup_error:
+                    errorList.append(
+                        u'Не удалось очистить параметр {0}: {1}'.format(
+                            POSITION_PARAM_NAME, cleanup_error
+                        )
+                    )
+
             if rollback_itemized == True:
                 definition.IsItemized = False
 
@@ -821,6 +969,16 @@ def execute():
                 if i in hidden:
                     definition.GetField(i).IsHidden = True
                 i += 1
+
+            if position_field_created and position_field_id is not None:
+                try:
+                    definition.RemoveField(position_field_id)
+                except Exception as cleanup_error:
+                    errorList.append(
+                        u'Не удалось удалить временное поле {0}: {1}'.format(
+                            POSITION_PARAM_NAME, cleanup_error
+                        )
+                    )
 
     if errorList:
         for error in set(errorList):
@@ -843,6 +1001,15 @@ if vsShedule:
         execute()
     except Exception as e:
         print(traceback.format_exc())
+    finally:
+        try:
+            remove_created_position_parameter()
+        except Exception as cleanup_error:
+            print(
+                u'Не удалось удалить созданный параметр {0}: {1}'.format(
+                    POSITION_PARAM_NAME, cleanup_error
+                )
+            )
     if len(report_rows) > 0:
         for report in report_rows:
             print('Некоторые элементы не были отработаны так как заняты пользователем ' + report)
