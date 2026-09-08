@@ -29,8 +29,15 @@ from pyrevit import forms
 
 TITLE = u"Сделать вложения необщими"
 NAME_SUFFIX = u"(Не общее)"
+DEBUG = False
 
 doc = __revit__.ActiveUIDocument.Document
+
+
+def debug(message):
+    if not DEBUG:
+        return
+    print(u"[Сделать вложения необщими] {}".format(message))
 
 
 def alert(message, details=None):
@@ -67,7 +74,7 @@ def collect_shared_nested_families(document):
 
 class FamilyOption(object):
     def __init__(self, family):
-        self.family = family
+        self.family_id = family.Id.IntegerValue
         self.name = family.Name
 
     def __str__(self):
@@ -113,15 +120,75 @@ def find_family_by_name(document, family_name):
     return None
 
 
-def make_family_not_shared(parent_document, family):
+def make_family_not_shared(parent_document, family, depth=1):
     family_document = None
     transaction = None
     temp_folder = None
     temp_path = None
-    new_name = family.Name + NAME_SUFFIX
+    family_name = family.Name
+    new_name = family_name + NAME_SUFFIX
+    result = {
+        "created": 0,
+        "replaced": 0,
+        "errors": [],
+        "loaded_family_id": None,
+        "loaded_family_name": new_name,
+    }
 
     try:
+        debug(
+            u"Уровень {0}: открываю «{1}», ID {2}; ожидаемая копия «{3}»".format(
+                depth, family_name, family.Id.IntegerValue, new_name
+            )
+        )
         family_document = parent_document.EditFamily(family)
+
+        nested_items = [
+            (item.Id, item.Name)
+            for item in collect_shared_nested_families(family_document)
+        ]
+        nested_replacements = {}
+        for nested_id, nested_name in nested_items:
+            try:
+                nested_family = family_document.GetElement(nested_id)
+                if nested_family is None or not nested_family.IsValidObject:
+                    raise RuntimeError(
+                        u"семейство с ID {} стало недоступно".format(
+                            nested_id.IntegerValue
+                        )
+                    )
+                nested_result = make_family_not_shared(
+                    family_document, nested_family, depth + 1
+                )
+                result["created"] += nested_result["created"]
+                result["replaced"] += nested_result["replaced"]
+                result["errors"].extend(nested_result["errors"])
+                nested_replacements[nested_name] = (
+                    nested_result["loaded_family_id"]
+                )
+            except Exception as error:
+                result["errors"].append(
+                    u"Уровень {0}: {1} -> {2}: {3}\n{4}".format(
+                        depth,
+                        family_name,
+                        nested_name,
+                        error,
+                        traceback.format_exc(),
+                    )
+                )
+
+        if nested_replacements:
+            nested_replaced, nested_errors = replace_ungrouped_instances(
+                family_document, nested_replacements
+            )
+            result["replaced"] += nested_replaced
+            for error in nested_errors:
+                result["errors"].append(
+                    u"Уровень {}: {}: {}".format(
+                        depth, family_name, error
+                    )
+                )
+
         parameter = family_document.OwnerFamily.get_Parameter(
             BuiltInParameter.FAMILY_SHARED
         )
@@ -134,7 +201,7 @@ def make_family_not_shared(parent_document, family):
         transaction.Commit()
         transaction = None
 
-        temp_folder, temp_path = temporary_family_path(family.Name)
+        temp_folder, temp_path = temporary_family_path(family_name)
         save_options = SaveAsOptions()
         save_options.OverwriteExistingFile = True
         family_document.SaveAs(temp_path, save_options)
@@ -142,12 +209,24 @@ def make_family_not_shared(parent_document, family):
             parent_document,
             OverwriteFamilyLoadOptions(),
         )
+        debug(
+            u"Уровень {}: LoadFamily завершён для «{}»".format(
+                depth, new_name
+            )
+        )
         loaded_family = find_family_by_name(parent_document, new_name)
         if loaded_family is None:
             raise RuntimeError(
                 u"загруженное семейство «{}» не найдено".format(new_name)
             )
-        return loaded_family
+        result["created"] += 1
+        result["loaded_family_id"] = loaded_family.Id.IntegerValue
+        debug(
+            u"Уровень {0}: копия найдена, имя «{1}», ID {2}".format(
+                depth, loaded_family.Name, loaded_family.Id.IntegerValue
+            )
+        )
+        return result
     except Exception:
         if transaction is not None:
             try:
@@ -173,11 +252,40 @@ def make_family_not_shared(parent_document, family):
                 pass
 
 
+def family_symbol_name(symbol):
+    parameter = symbol.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+    if parameter is None:
+        raise RuntimeError(
+            u"у типа ID {} отсутствует параметр имени".format(
+                symbol.Id.IntegerValue
+            )
+        )
+    name = parameter.AsString()
+    if not name:
+        name = parameter.AsValueString()
+    if not name:
+        raise RuntimeError(
+            u"не удалось прочитать имя типа ID {}".format(
+                symbol.Id.IntegerValue
+            )
+        )
+    return name
+
+
 def family_symbols_by_name(document, family):
     result = {}
     for symbol_id in family.GetFamilySymbolIds():
+        debug(
+            u"Читаю тип целевого семейства «{}», SymbolId {}".format(
+                family.Name, symbol_id.IntegerValue
+            )
+        )
         symbol = document.GetElement(symbol_id)
-        result[symbol.Name] = symbol
+        if symbol is None or not symbol.IsValidObject:
+            raise RuntimeError(
+                u"тип с ID {} недоступен".format(symbol_id.IntegerValue)
+            )
+        result[family_symbol_name(symbol)] = symbol
     return result
 
 
@@ -196,29 +304,121 @@ def replace_ungrouped_instances(document, replacements):
             .WhereElementIsNotElementType()
             .ToElements()
         )
-        symbols_by_family_id = {}
-        for old_family_id, new_family in replacements.items():
-            symbols_by_family_id[old_family_id] = family_symbols_by_name(
-                document, new_family
+        symbols_by_source_name = {}
+        debug(
+            u"Начало замены. Карта исходных семейств: {}".format(
+                u", ".join(sorted(replacements.keys()))
             )
+        )
+        for old_family_name, new_family_id_value in replacements.items():
+            try:
+                debug(
+                    u"Восстанавливаю целевое семейство для «{0}» по ID {1}".format(
+                        old_family_name, new_family_id_value
+                    )
+                )
+                new_family = document.GetElement(
+                    ElementId(new_family_id_value)
+                )
+                if new_family is None or not new_family.IsValidObject:
+                    raise RuntimeError(u"загруженная копия недоступна")
+                debug(
+                    u"Целевое семейство получено: «{}», ID {}".format(
+                        new_family.Name, new_family.Id.IntegerValue
+                    )
+                )
+                target_symbols = family_symbols_by_name(
+                    document, new_family
+                )
+                if (
+                    old_family_name not in target_symbols
+                    and new_family.Name in target_symbols
+                ):
+                    target_symbols[old_family_name] = target_symbols[
+                        new_family.Name
+                    ]
+                    debug(
+                        u"Добавлен алиас типа: «{}» -> «{}»".format(
+                            old_family_name, new_family.Name
+                        )
+                    )
+                symbols_by_source_name[old_family_name] = target_symbols
+                debug(
+                    u"Источник «{0}» -> цель «{1}» (ID {2}); типы цели: {3}".format(
+                        old_family_name,
+                        new_family.Name,
+                        new_family.Id.IntegerValue,
+                        u", ".join(
+                            sorted(
+                                symbols_by_source_name[
+                                    old_family_name
+                                ].keys()
+                            )
+                        ),
+                    )
+                )
+            except Exception as error:
+                errors.append(
+                    u"Для исходного семейства «{}» не удалось подготовить "
+                    u"загруженную копию: {}\n{}".format(
+                        old_family_name, error, traceback.format_exc()
+                    )
+                )
+                debug(
+                    u"Ошибка подготовки цели для «{}»: {}\n{}".format(
+                        old_family_name, error, traceback.format_exc()
+                    )
+                )
 
+        matched_source_names = set()
         for instance in instances:
-            if instance.GroupId != ElementId.InvalidElementId:
-                continue
             old_symbol = instance.Symbol
-            old_family_id = old_symbol.Family.Id.IntegerValue
-            if old_family_id not in replacements:
+            old_family_name = old_symbol.Family.Name
+            old_symbol_name = family_symbol_name(old_symbol)
+            debug(
+                u"Экземпляр ID {0}: семейство «{1}», тип «{2}», GroupId {3}".format(
+                    instance.Id.IntegerValue,
+                    old_family_name,
+                    old_symbol_name,
+                    instance.GroupId.IntegerValue,
+                )
+            )
+            if old_family_name not in symbols_by_source_name:
+                debug(
+                    u"Экземпляр ID {} пропущен: имя семейства отсутствует "
+                    u"в карте замены".format(instance.Id.IntegerValue)
+                )
+                continue
+            matched_source_names.add(old_family_name)
+            if instance.GroupId != ElementId.InvalidElementId:
+                debug(
+                    u"Экземпляр ID {} пропущен: находится в группе".format(
+                        instance.Id.IntegerValue
+                    )
+                )
+                errors.append(
+                    u"{} (ID {}): экземпляр в группе не заменён.".format(
+                        old_symbol.Family.Name,
+                        instance.Id.IntegerValue,
+                    )
+                )
                 continue
 
-            new_symbol = symbols_by_family_id[old_family_id].get(
-                old_symbol.Name
+            new_symbol = symbols_by_source_name[old_family_name].get(
+                old_symbol_name
             )
             if new_symbol is None:
+                debug(
+                    u"Экземпляр ID {}: тип «{}» отсутствует в целевом "
+                    u"семействе".format(
+                        instance.Id.IntegerValue, old_symbol_name
+                    )
+                )
                 errors.append(
                     u"{} (ID {}): в новом семействе нет типа «{}».".format(
                         old_symbol.Family.Name,
                         instance.Id.IntegerValue,
-                        old_symbol.Name,
+                        old_symbol_name,
                     )
                 )
                 continue
@@ -228,9 +428,27 @@ def replace_ungrouped_instances(document, replacements):
                 subtransaction.Start()
                 if not new_symbol.IsActive:
                     new_symbol.Activate()
+                debug(
+                    u"Экземпляр ID {0}: назначаю «{1} : {2}», SymbolId {3}".format(
+                        instance.Id.IntegerValue,
+                        new_symbol.Family.Name,
+                        family_symbol_name(new_symbol),
+                        new_symbol.Id.IntegerValue,
+                    )
+                )
                 instance.Symbol = new_symbol
                 subtransaction.Commit()
                 replaced += 1
+                current_symbol = instance.Symbol
+                debug(
+                    u"Экземпляр ID {0}: замена завершена; теперь «{1} : {2}», "
+                    u"SymbolId {3}".format(
+                        instance.Id.IntegerValue,
+                        current_symbol.Family.Name,
+                        family_symbol_name(current_symbol),
+                        current_symbol.Id.IntegerValue,
+                    )
+                )
             except Exception as error:
                 try:
                     subtransaction.RollBack()
@@ -243,7 +461,21 @@ def replace_ungrouped_instances(document, replacements):
                         error,
                     )
                 )
+                debug(
+                    u"Экземпляр ID {}: ошибка замены: {}\n{}".format(
+                        instance.Id.IntegerValue,
+                        error,
+                        traceback.format_exc(),
+                    )
+                )
+        for source_name in symbols_by_source_name:
+            if source_name not in matched_source_names:
+                errors.append(
+                    u"Для исходного семейства «{}» не найдено размещённых "
+                    u"экземпляров.".format(source_name)
+                )
         transaction.Commit()
+        debug(u"Транзакция замены завершена. Заменено: {}".format(replaced))
     except Exception:
         transaction.RollBack()
         raise
@@ -275,11 +507,25 @@ def main():
     completed = []
     replacements = {}
     errors = []
+    created_count = 0
+    nested_replaced_count = 0
     for option in selected:
         try:
-            new_family = make_family_not_shared(doc, option.family)
-            replacements[option.family.Id.IntegerValue] = new_family
-            completed.append(new_family.Name)
+            family = doc.GetElement(ElementId(option.family_id))
+            if family is None or not family.IsValidObject:
+                raise RuntimeError(
+                    u"семейство с ID {} стало недоступно".format(
+                        option.family_id
+                    )
+                )
+            family_result = make_family_not_shared(doc, family)
+            replacements[option.name] = (
+                family_result["loaded_family_id"]
+            )
+            completed.append(family_result["loaded_family_name"])
+            created_count += family_result["created"]
+            nested_replaced_count += family_result["replaced"]
+            errors.extend(family_result["errors"])
         except Exception as error:
             errors.append(
                 u"{}: {}\n{}".format(
@@ -305,12 +551,16 @@ def main():
             )
 
     summary = (
-        u"Создано и загружено семейств: {0} из {1}.\n"
-        u"Заменено экземпляров вне групп: {2}."
+        u"Создано и загружено необщих семейств на всех уровнях: {0}.\n"
+        u"Обработано выбранных семейств первого уровня: {1} из {2}.\n"
+        u"Заменено экземпляров первого уровня вне групп: {3}.\n"
+        u"Заменено экземпляров на вложенных уровнях вне групп: {4}."
     ).format(
+        created_count,
         len(completed),
         len(selected),
         replaced_count,
+        nested_replaced_count,
     )
     if completed:
         summary += u"\n\n" + u"\n".join(completed)
