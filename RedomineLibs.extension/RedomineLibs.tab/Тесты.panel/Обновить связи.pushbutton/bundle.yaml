@@ -1,8 +1,0 @@
-﻿title:
-  ru: Обновить связи
-tooltip:
-  ru: Пакетное обновление связей Revit, сохранение как файл хранилища и синхронизация. Рекомендуется запускать без открытых проектов.
-author: Junie
-context: zero-doc
-engine:
-  persistent: true
