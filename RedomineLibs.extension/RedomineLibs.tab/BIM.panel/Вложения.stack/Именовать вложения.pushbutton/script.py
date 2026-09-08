@@ -23,12 +23,19 @@ from pyrevit import forms
 
 
 TITLE = u"Именовать вложения"
+DEBUG = False
 DESCRIPTION_PARAMETER = u"ФОП_Описание"
 TYPE_DESCRIPTION_PARAMETER = u"ФОП_Описание типа"
 PARENT_NAME_PARAMETER = u"ADSK_Наименование"
 PARENT_MARK_PARAMETER = u"ADSK_Марка"
 
 doc = __revit__.ActiveUIDocument.Document
+
+
+def debug(message):
+    if not DEBUG:
+        return
+    print(u"[Именовать вложения] {}".format(message))
 
 
 def alert(message, details=None):
@@ -115,10 +122,22 @@ class OverwriteFamilyLoadOptions(IFamilyLoadOptions):
         return True
 
 
-def update_nested_family(parent_document, family, definitions):
+def update_nested_family(parent_document, family, definitions, depth=1):
     family_document = None
     transaction = None
+    family_name = family.Name
+    family_id = family.Id.IntegerValue
+    result = {
+        "added": 0,
+        "processed": 0,
+        "errors": [],
+    }
     try:
+        debug(
+            u"Уровень {}: открытие семейства «{}» (ID {})".format(
+                depth, family_name, family_id
+            )
+        )
         family_document = parent_document.EditFamily(family)
         transaction = Transaction(
             family_document, u"Добавление параметров описания"
@@ -127,11 +146,77 @@ def update_nested_family(parent_document, family, definitions):
         added = ensure_instance_parameters(family_document, definitions)
         transaction.Commit()
         transaction = None
+        result["added"] += len(added)
+        result["processed"] += 1
+        debug(
+            u"Уровень {}: «{}», добавлено параметров: {}".format(
+                depth, family_name, len(added)
+            )
+        )
 
+        nested_items = [
+            (item.Id, item.Name)
+            for item in collect_nested_families(family_document)
+        ]
+        debug(
+            u"Уровень {}: в «{}» найдено вложенных семейств: {}".format(
+                depth, family_name, len(nested_items)
+            )
+        )
+        for nested_id, nested_name in nested_items:
+            try:
+                nested_family = family_document.GetElement(nested_id)
+                if nested_family is None or not nested_family.IsValidObject:
+                    raise RuntimeError(
+                        u"семейство с ID {} стало недоступно".format(
+                            nested_id.IntegerValue
+                        )
+                    )
+                nested_result = update_nested_family(
+                    family_document, nested_family, definitions, depth + 1
+                )
+                result["added"] += nested_result["added"]
+                result["processed"] += nested_result["processed"]
+                result["errors"].extend(nested_result["errors"])
+            except Exception as error:
+                result["errors"].append(
+                    u"{} -> {}: {}\n{}".format(
+                        family_name, nested_name, error, traceback.format_exc()
+                    )
+                )
+                debug(
+                    u"Ошибка уровня {}: «{}» -> «{}»: {}".format(
+                        depth, family_name, nested_name, error
+                    )
+                )
+
+        own_parameters = family_parameters_by_name(family_document)
+        nested_parent_parameters = {
+            PARENT_NAME_PARAMETER: own_parameters[DESCRIPTION_PARAMETER],
+            PARENT_MARK_PARAMETER: own_parameters[
+                TYPE_DESCRIPTION_PARAMETER
+            ],
+        }
+        unused_updated, unused_grouped, nested_errors = (
+            associate_nested_instance_parameters(
+                family_document, nested_parent_parameters
+            )
+        )
+        for error in nested_errors:
+            result["errors"].append(
+                u"{}: {}".format(family_name, error)
+            )
+
+        debug(
+            u"Уровень {}: загрузка «{}» в материнское семейство".format(
+                depth, family_name
+            )
+        )
         family_document.LoadFamily(
             parent_document, OverwriteFamilyLoadOptions()
         )
-        return added
+        debug(u"Уровень {}: «{}» загружено".format(depth, family_name))
+        return result
     except Exception:
         if transaction is not None:
             try:
@@ -338,30 +423,57 @@ def main():
     families = collect_nested_families(
         doc, selected_instances if selected_ids else None
     )
+    family_items = [(family.Id, family.Name) for family in families]
+    debug(
+        u"Режим: {}; семейств первого уровня: {}".format(
+            u"выделение" if selected_ids else u"все элементы",
+            len(family_items),
+        )
+    )
     family_errors = []
     added_count = 0
     processed_count = 0
-    for family in families:
+    for family_id, family_name in family_items:
         try:
-            added_count += len(
-                update_nested_family(
-                    doc,
-                    family,
-                    definitions,
+            family = doc.GetElement(family_id)
+            if family is None or not family.IsValidObject:
+                raise RuntimeError(
+                    u"семейство с ID {} стало недоступно".format(
+                        family_id.IntegerValue
+                    )
+                )
+            family_result = update_nested_family(
+                doc,
+                family,
+                definitions,
+            )
+            added_count += family_result["added"]
+            processed_count += family_result["processed"]
+            family_errors.extend(family_result["errors"])
+        except Exception as error:
+            family_errors.append(
+                u"{}: {}\n{}".format(
+                    family_name, error, traceback.format_exc()
                 )
             )
-            processed_count += 1
-        except Exception as error:
-            family_errors.append(u"{}: {}".format(family.Name, error))
+            debug(
+                u"Ошибка семейства первого уровня «{}» (ID {}): {}".format(
+                    family_name, family_id.IntegerValue, error
+                )
+            )
 
     try:
+        parent_parameters = family_parameters_by_name(doc)
+        debug(u"Родительские параметры повторно получены после загрузок")
         if selected_ids:
             updated_count, instance_errors = associate_selected_instance_parameters(
                 doc, parent_parameters, selected_ids
             )
             grouped_count = sum(
-                1 for instance in selected_instances
-                if instance.GroupId != ElementId.InvalidElementId
+                1 for element_id in selected_ids
+                if isinstance(doc.GetElement(element_id), FamilyInstance)
+                and doc.GetElement(element_id).GroupId
+                != ElementId.InvalidElementId
             )
         else:
             updated_count, grouped_count, instance_errors = associate_nested_instance_parameters(
@@ -379,13 +491,14 @@ def main():
         else u"Режим: все вложенные элементы.\n"
     )
     summary = mode_text + (
-        u"Обработано вложенных семейств: {0} из {1}.\n"
+        u"Обработано вложенных семейств на всех уровнях: {0}.\n"
+        u"Семейств первого уровня: {1}.\n"
         u"Добавлено параметров: {2}.\n"
         u"Связано вложенных экземпляров: {3}.\n"
         u"Пропущено экземпляров в группах: {4}."
     ).format(
         processed_count,
-        len(families),
+        len(family_items),
         added_count,
         updated_count,
         grouped_count,
