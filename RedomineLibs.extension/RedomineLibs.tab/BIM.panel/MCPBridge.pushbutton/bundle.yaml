@@ -1,0 +1,4 @@
+title: MCP Bridge
+tooltip: Executes one validated document operation queued by rvt-mcp.
+author: Redomine
+context: zero-doc
