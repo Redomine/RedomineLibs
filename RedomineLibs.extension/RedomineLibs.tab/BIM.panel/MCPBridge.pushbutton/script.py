@@ -146,6 +146,44 @@ def _open_family(request):
     return _document_summary(ui_document.Document)
 
 
+def _execute_pyrevit_command(request):
+    command_path = os.path.abspath(request["commandPath"])
+    if not command_path.lower().endswith(".pushbutton") or not os.path.isdir(command_path):
+        raise RuntimeError("commandPath must be an existing .pushbutton directory.")
+    script_path = os.path.join(command_path, "script.py")
+    if not os.path.isfile(script_path):
+        raise RuntimeError("The .pushbutton directory does not contain script.py.")
+    if request.get("requiresSelection", False):
+        ui_document = HOST_APP.uiapp.ActiveUIDocument
+        if ui_document is None or ui_document.Selection.GetElementIds().Count == 0:
+            raise RuntimeError("This pyRevit command requires at least one selected element.")
+
+    command_globals = dict(globals())
+    command_globals.update({
+        "__name__": "__main__",
+        "__file__": script_path,
+        "__commandpath__": command_path,
+        "__commandname__": os.path.basename(command_path)[:-len(".pushbutton")],
+        "__shiftclick__": False,
+        "__forceddebugmode__": False
+    })
+    previous_path = list(sys.path)
+    try:
+        library_path = os.path.join(command_path, "lib")
+        if os.path.isdir(library_path) and library_path not in sys.path:
+            sys.path.insert(0, library_path)
+        if command_path not in sys.path:
+            sys.path.insert(0, command_path)
+        execfile(script_path, command_globals)
+    finally:
+        sys.path[:] = previous_path
+    return {
+        "commandPath": command_path,
+        "scriptPath": script_path,
+        "requiresSelection": bool(request.get("requiresSelection", False))
+    }
+
+
 def _dialog_events(run_id):
     path = os.path.join(BRIDGE_ROOT, "dialogs-{0}.jsonl".format(run_id))
     if not os.path.exists(path):
@@ -181,6 +219,8 @@ def main():
             data = _open_model(request)
         elif request.get("operation") == "open_family":
             data = _open_family(request)
+        elif request.get("operation") == "execute_pyrevit_command":
+            data = _execute_pyrevit_command(request)
         else:
             raise RuntimeError("Unsupported bridge operation: {0}".format(request.get("operation")))
         response.update({"status": "completed", "success": True, "data": data})
@@ -203,4 +243,3 @@ def main():
 
 
 main()
-
