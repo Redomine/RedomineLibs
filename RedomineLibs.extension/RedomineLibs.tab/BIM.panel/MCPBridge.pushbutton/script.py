@@ -4,13 +4,16 @@ from __future__ import print_function
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import traceback
 
-from System import Environment
+from System import DateTime, Environment
 from System.Collections.Generic import List
+from Autodesk.Revit.UI import RevitCommandId
 from pyrevit import DB, HOST_APP, script
+from pyrevit.coreutils import ribbon
 
 
 BRIDGE_ROOT = os.path.join(
@@ -74,6 +77,26 @@ def _build_workset_configuration(model_path, mode, requested_names):
     return configuration, [preview.Name for preview in previews]
 
 
+def _next_local_model_path(central_path):
+    documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+    if not documents or not os.path.isdir(documents):
+        raise RuntimeError("The current user's Documents folder is unavailable.")
+
+    base_name = os.path.splitext(os.path.basename(central_path))[0]
+    user_name = getattr(HOST_APP, "username", None) or HOST_APP.app.Username or "user"
+    safe_user_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(user_name)).strip(" .") or "user"
+    local_name = "{0}_{1}_{2}".format(
+        base_name,
+        safe_user_name,
+        DateTime.Now.ToString("yyyyMMdd_HHmmss"))
+    candidate = os.path.join(documents, local_name + ".rvt")
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(documents, "{0}_{1}.rvt".format(local_name, suffix))
+        suffix += 1
+    return candidate
+
+
 def _document_summary(document):
     worksets = []
     if document.IsWorkshared:
@@ -115,8 +138,15 @@ def _open_model(request):
     _ensure_not_open(path)
     model_path = DB.ModelPathUtils.ConvertUserVisiblePathToModelPath(path)
     options = DB.OpenOptions()
-    if request.get("detach", False):
+    detach = request.get("detach", False)
+    local_path = None
+    if detach:
         options.DetachFromCentralOption = DB.DetachFromCentralOption.DetachAndPreserveWorksets
+    else:
+        local_path = _next_local_model_path(path)
+        local_model_path = DB.ModelPathUtils.ConvertUserVisiblePathToModelPath(local_path)
+        DB.WorksharingUtils.CreateNewLocal(model_path, local_model_path)
+        model_path = local_model_path
 
     mode = request.get("worksetMode", "all")
     configuration, available_names = _build_workset_configuration(
@@ -130,6 +160,8 @@ def _open_model(request):
     if request.get("unloadLinksAfterOpen", False):
         links = _unload_links_for_open_document(document)
     result = _document_summary(document)
+    result["sourcePath"] = path
+    result["localPath"] = local_path
     result["availableWorksetsBeforeOpen"] = available_names
     result["links"] = links
     return result
@@ -158,29 +190,31 @@ def _execute_pyrevit_command(request):
         if ui_document is None or ui_document.Selection.GetElementIds().Count == 0:
             raise RuntimeError("This pyRevit command requires at least one selected element.")
 
-    command_globals = dict(globals())
-    command_globals.update({
-        "__name__": "__main__",
-        "__file__": script_path,
-        "__commandpath__": command_path,
-        "__commandname__": os.path.basename(command_path)[:-len(".pushbutton")],
-        "__shiftclick__": False,
-        "__forceddebugmode__": False
-    })
-    previous_path = list(sys.path)
-    try:
-        library_path = os.path.join(command_path, "lib")
-        if os.path.isdir(library_path) and library_path not in sys.path:
-            sys.path.insert(0, library_path)
-        if command_path not in sys.path:
-            sys.path.insert(0, command_path)
-        execfile(script_path, command_globals)
-    finally:
-        sys.path[:] = previous_path
+    command = script.get_command_from_path(command_path)
+    if command is None:
+        raise RuntimeError("pyRevit did not find a registered command for commandPath.")
+    button = ribbon.get_uibutton(command.unique_name)
+    if button is None:
+        raise RuntimeError("The registered pyRevit Ribbon button was not found: {0}".format(command.unique_name))
+    adwindows_button = button.get_adwindows_object()
+    command_id_text = getattr(adwindows_button, "Id", None)
+    if not command_id_text:
+        raise RuntimeError("The pyRevit Ribbon button does not expose a Revit command ID.")
+    command_id_text = str(command_id_text)
+    command_id = RevitCommandId.LookupCommandId(command_id_text)
+    if command_id is None:
+        raise RuntimeError("Revit did not resolve the pyRevit command ID: {0}".format(command_id_text))
+    if not HOST_APP.uiapp.CanPostCommand(command_id):
+        raise RuntimeError("The pyRevit command cannot be posted in the current Revit context: {0}".format(command_id_text))
+    HOST_APP.uiapp.PostCommand(command_id)
     return {
+        "status": "posted",
         "commandPath": command_path,
         "scriptPath": script_path,
-        "requiresSelection": bool(request.get("requiresSelection", False))
+        "commandId": command_id_text,
+        "commandUniqueName": command.unique_name,
+        "requiresSelection": bool(request.get("requiresSelection", False)),
+        "outputWindowIdsBefore": request.get("outputWindowIdsBefore", [])
     }
 
 
