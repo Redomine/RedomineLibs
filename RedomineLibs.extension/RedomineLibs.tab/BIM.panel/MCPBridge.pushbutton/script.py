@@ -9,11 +9,10 @@ import shutil
 import sys
 import traceback
 
-from System import DateTime, Environment
+from System import Activator, AppDomain, DateTime, Environment
 from System.Collections.Generic import List
 from Autodesk.Revit.UI import RevitCommandId
-from pyrevit import DB, HOST_APP, script
-from pyrevit.coreutils import ribbon
+from pyrevit import DB, HOST_APP
 
 
 BRIDGE_ROOT = os.path.join(
@@ -178,6 +177,46 @@ def _open_family(request):
     return _document_summary(ui_document.Document)
 
 
+def _find_loaded_pyrevit_command(script_path):
+    runtime_type = None
+    assemblies = list(AppDomain.CurrentDomain.GetAssemblies())
+    for assembly in assemblies:
+        runtime_type = assembly.GetType(
+            "PyRevitLabs.PyRevit.Runtime.ScriptCommand", False)
+        if runtime_type is not None:
+            break
+    if runtime_type is None:
+        raise RuntimeError("The pyRevit runtime is not loaded in this Revit process.")
+
+    script_data_field = runtime_type.GetField("ScriptData")
+    if script_data_field is None:
+        raise RuntimeError("The loaded pyRevit runtime does not expose ScriptData.")
+
+    for assembly in assemblies:
+        try:
+            command_types = assembly.GetTypes()
+        except Exception as error:
+            command_types = getattr(error, "Types", None) or []
+        for command_type in command_types:
+            if (command_type is None or command_type.IsAbstract
+                    or command_type == runtime_type
+                    or not runtime_type.IsAssignableFrom(command_type)):
+                continue
+            try:
+                instance = Activator.CreateInstance(command_type)
+                script_data = script_data_field.GetValue(instance)
+                loaded_script_path = getattr(script_data, "ScriptPath", None)
+                if not _same_path(loaded_script_path, script_path):
+                    continue
+                return {
+                    "commandId": str(getattr(script_data, "CommandControlId", "")),
+                    "commandUniqueName": str(getattr(script_data, "CommandUniqueId", ""))
+                }
+            except Exception:
+                continue
+    return None
+
+
 def _execute_pyrevit_command(request):
     command_path = os.path.abspath(request["commandPath"])
     if not command_path.lower().endswith(".pushbutton") or not os.path.isdir(command_path):
@@ -190,17 +229,12 @@ def _execute_pyrevit_command(request):
         if ui_document is None or ui_document.Selection.GetElementIds().Count == 0:
             raise RuntimeError("This pyRevit command requires at least one selected element.")
 
-    command = script.get_command_from_path(command_path)
+    command = _find_loaded_pyrevit_command(script_path)
     if command is None:
-        raise RuntimeError("pyRevit did not find a registered command for commandPath.")
-    button = ribbon.get_uibutton(command.unique_name)
-    if button is None:
-        raise RuntimeError("The registered pyRevit Ribbon button was not found: {0}".format(command.unique_name))
-    adwindows_button = button.get_adwindows_object()
-    command_id_text = getattr(adwindows_button, "Id", None)
+        raise RuntimeError("pyRevit did not find a loaded command for commandPath.")
+    command_id_text = command["commandId"]
     if not command_id_text:
         raise RuntimeError("The pyRevit Ribbon button does not expose a Revit command ID.")
-    command_id_text = str(command_id_text)
     command_id = RevitCommandId.LookupCommandId(command_id_text)
     if command_id is None:
         raise RuntimeError("Revit did not resolve the pyRevit command ID: {0}".format(command_id_text))
@@ -212,7 +246,7 @@ def _execute_pyrevit_command(request):
         "commandPath": command_path,
         "scriptPath": script_path,
         "commandId": command_id_text,
-        "commandUniqueName": command.unique_name,
+        "commandUniqueName": command["commandUniqueName"],
         "requiresSelection": bool(request.get("requiresSelection", False)),
         "outputWindowIdsBefore": request.get("outputWindowIdsBefore", [])
     }
