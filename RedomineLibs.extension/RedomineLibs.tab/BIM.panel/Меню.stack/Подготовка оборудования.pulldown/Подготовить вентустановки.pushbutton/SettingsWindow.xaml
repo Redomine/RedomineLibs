@@ -1,0 +1,68 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Подготовить вентустановки"
+        Width="640" Height="720" MinWidth="560" MinHeight="600"
+        WindowStartupLocation="CenterScreen" ShowInTaskbar="False"
+        Background="#FFF8FAFA" FontFamily="Segoe UI" FontSize="13">
+    <Window.Resources>
+        <Style TargetType="CheckBox">
+            <Setter Property="Margin" Value="0,10,0,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="BorderBrush" Value="#FFB9C6C4" />
+            <Setter Property="Padding" Value="8,6" />
+            <Setter Property="FontFamily" Value="Consolas" />
+            <Setter Property="FontSize" Value="12" />
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="MinWidth" Value="105" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="12,4" />
+        </Style>
+    </Window.Resources>
+    <DockPanel Margin="20">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button Content="Отмена" Click="cancel_click" Margin="0,0,8,0" />
+            <Button Content="Выбрать папку" Click="run_click"
+                    Background="#FF176B63" Foreground="White" BorderBrush="#FF12564F" />
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <TextBlock FontSize="17" FontWeight="SemiBold" Text="Обработка семейств RFA" />
+                <TextBlock Margin="0,4,0,8" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="После выбора настроек укажите папку с семействами. Исходные файлы будут скопированы в «Архив»." />
+
+                <CheckBox x:Name="child_names_check" Content="Исключить вложенные элементы из наименования" />
+                <TextBlock Margin="22,3,0,0" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Записывает «!Не учитывать» в ADSK_Наименование вложенных семейств." />
+
+                <CheckBox x:Name="names_check" Content="Назначить наименование вентустановки" />
+                <TextBlock Margin="22,3,0,0" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Ищет ключ в имени файла RFA и записывает соответствующее значение в ADSK_Наименование. Используется первое совпадение сверху." />
+
+                <CheckBox x:Name="codes_check" Content="Очистить код изделия" />
+                <TextBlock Margin="22,3,0,0" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Устанавливает пустое значение параметра ADSK_Код изделия." />
+
+                <CheckBox x:Name="formulas_check" Content="Назначить формулы параметрам" />
+                <TextBlock Margin="22,3,0,0" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Записывает указанные формулы в параметры семейств." />
+
+                <Border Height="1" Background="#FFD8E1DF" Margin="0,16,0,12" />
+                <TextBlock FontWeight="SemiBold" Text="Правила наименования" />
+                <TextBlock Margin="0,3,0,6" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Одна строка: часть имени файла = значение ADSK_Наименование" />
+                <TextBox x:Name="name_rules_text" Height="112" AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap" />
+
+                <TextBlock Margin="0,14,0,0" FontWeight="SemiBold" Text="Формулы" />
+                <TextBlock Margin="0,3,0,6" Foreground="#FF52615F" TextWrapping="Wrap"
+                           Text="Одна строка: имя параметра = формула Revit" />
+                <TextBox x:Name="formula_rules_text" Height="86" AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap" />
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

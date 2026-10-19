@@ -19,7 +19,7 @@ from dosymep.Bim4Everyone import *
 import sys
 import System
 from Autodesk.Revit.DB import *
-from pyrevit import revit, forms
+from pyrevit import revit, forms, script
 from Autodesk.Revit.DB.Mechanical import DuctSystemType
 from Autodesk.Revit.DB import ConnectorElement, MEPSystemClassification
 import os
@@ -41,28 +41,73 @@ LOG_FILE_NAME = u"Пересоздать_фитинги.log"
 LOG_PATH = None
 REVIT_BACKUP_RE = re.compile(r"\.\d{4}\.rfa$", re.IGNORECASE)
 
-nulify_child_names = True # Нужно ли заменять ADSK_Наименование вложений на !Не учитывать
-nulify_names = True # Нужно ли приводить ADSK_Наименование установок к виду заданному в NAME_KEYS
-nulify_codes = True # Нужно ли обнулять значение ADSK_Код изделия
-use_custom_formulas = True # Нужно ли назначать формулы
+NAME_KEYS = u"-p = Приточная установка\n-v = Вытяжная установка\n-mo = Вытяжная установка\nВытяжная = Вытяжная установка"
+CUSTOM_FORMULAS = u"ADSK_Марка = ADSK_Наименование краткое"
+SETTINGS_SECTION = "Redomine_PrepareVentUnits"
+XAML_FILE = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
 
-"""
-В ключи словаря пишем ключ, встречаемый в имени семейства.  
-Можно свободно добавлять новые ключи
-"""
-NAME_KEYS = {"-p": "Приточная установка",
-             "-v": "Вытяжная установка",
-             "-mo":"Вытяжная установка",
-             "Вытяжная": "Вытяжная установка"}
 
-"""
-В кастом формулы пишем, если нужно задать формулу во всех семействах.
-Например, {"ADSK_Марка": 'ADSK_Наименование краткое'} приравняет все марки кратким наименованиям
-Формул можно писать любое число
-"""
+def parse_rules(value, title):
+    rules = []
+    seen = set()
+    for line_number, line in enumerate(value.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        if u"=" not in line:
+            raise ValueError(u"{}: строка {} должна содержать знак =".format(title, line_number))
+        key, result = (part.strip() for part in line.split(u"=", 1))
+        if not key or not result:
+            raise ValueError(u"{}: в строке {} заполните обе части".format(title, line_number))
+        if key in seen:
+            raise ValueError(u"{}: ключ «{}» указан дважды".format(title, key))
+        seen.add(key)
+        rules.append((key, result))
+    return rules
 
-#CUSTOM_FORMULAS = {"": ""}
-CUSTOM_FORMULAS = {"ADSK_Марка": 'ADSK_Наименование краткое'}
+
+class SettingsWindow(forms.WPFWindow):
+    def __init__(self):
+        forms.WPFWindow.__init__(self, XAML_FILE)
+        self.result = None
+        self.config = script.get_config(SETTINGS_SECTION)
+        self.child_names_check.IsChecked = getattr(self.config, "child_names", False)
+        self.names_check.IsChecked = getattr(self.config, "names", False)
+        self.codes_check.IsChecked = getattr(self.config, "codes", False)
+        self.formulas_check.IsChecked = getattr(self.config, "formulas", False)
+        self.name_rules_text.Text = getattr(self.config, "name_rules", NAME_KEYS)
+        self.formula_rules_text.Text = getattr(self.config, "formula_rules", CUSTOM_FORMULAS)
+
+    def run_click(self, sender, args):
+        settings = {
+            "child_names": bool(self.child_names_check.IsChecked),
+            "names": bool(self.names_check.IsChecked),
+            "codes": bool(self.codes_check.IsChecked),
+            "formulas": bool(self.formulas_check.IsChecked),
+        }
+        try:
+            settings["name_rules"] = parse_rules(self.name_rules_text.Text, u"Наименования")
+            settings["formula_rules"] = parse_rules(self.formula_rules_text.Text, u"Формулы")
+            if settings["names"] and not settings["name_rules"]:
+                raise ValueError(u"Добавьте хотя бы одно правило наименования.")
+            if settings["formulas"] and not settings["formula_rules"]:
+                raise ValueError(u"Добавьте хотя бы одну формулу.")
+        except ValueError as error:
+            forms.alert(unicode(error), title=u"Проверьте настройки")
+            return
+
+        self.config.child_names = settings["child_names"]
+        self.config.names = settings["names"]
+        self.config.codes = settings["codes"]
+        self.config.formulas = settings["formulas"]
+        self.config.name_rules = self.name_rules_text.Text
+        self.config.formula_rules = self.formula_rules_text.Text
+        script.save_config()
+        self.result = settings
+        self.Close()
+
+    def cancel_click(self, sender, args):
+        self.Close()
 
 def safe_text(value):
     try:
@@ -229,20 +274,20 @@ def is_params_exist(family_doc, family_name):
 
     return is_all_params_exist
 
-def process_adsk_parameters(family_doc, family_name):
+def process_adsk_parameters(family_doc, family_name, settings):
     is_params_exist(family_doc, family_name)
 
-    if nulify_child_names:
+    if settings["child_names"]:
         process_nested_families(family_doc)
 
-    if nulify_names:
-        set_installation_name(family_doc, family_name)
+    if settings["names"]:
+        set_installation_name(family_doc, family_name, settings["name_rules"])
 
-    if nulify_codes:
+    if settings["codes"]:
         set_fam_param_value(family_doc, "ADSK_Код изделия", "")
-    if use_custom_formulas:
-        for param_name in CUSTOM_FORMULAS:
-            set_fam_param_formula(family_doc, param_name, CUSTOM_FORMULAS[param_name])
+    if settings["formulas"]:
+        for param_name, formula in settings["formula_rules"]:
+            set_fam_param_formula(family_doc, param_name, formula)
 
     return True
 
@@ -256,10 +301,11 @@ def process_nested_families(family_doc):
         if name_param:
             name_param.Set("!Не учитывать")
 
-def set_installation_name(family_doc, family_name):
-    for key in NAME_KEYS:
+def set_installation_name(family_doc, family_name, name_rules):
+    for key, value in name_rules:
         if key in family_name:
-            set_fam_param_value(family_doc, "ADSK_Наименование", NAME_KEYS[key])
+            set_fam_param_value(family_doc, "ADSK_Наименование", value)
+            break
 
 def ensure_output_dirs(base_dir):
     done_dir = os.path.join(base_dir, FOLDER_DONE)
@@ -322,6 +368,12 @@ def remove_backups(base_dir):
                 )
 
 def main():
+    window = SettingsWindow()
+    window.ShowDialog()
+    settings = window.result
+    if settings is None:
+        return
+
     families_folder = select_families_folder()
     init_log(families_folder)
 
@@ -404,7 +456,7 @@ def main():
             t.Start()
 
             family_name = os.path.splitext(os.path.basename(family_path))[0]
-            process_adsk_parameters(family_doc, family_name)
+            process_adsk_parameters(family_doc, family_name, settings)
 
             if connect_duct_connectors(family_doc):
                 updated = True
