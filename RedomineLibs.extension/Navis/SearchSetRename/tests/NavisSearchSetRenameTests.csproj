@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>NavisSearchSetRenameTests</AssemblyName>
+    <RootNamespace>Redomine.NavisSearchSetRename.Tests</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <!--
+    Тесты используют чистую логику SearchSetRenameLogic, не зависящую от
+    Navis API. Копируем исходник через <Compile Include="..\..."> — без ссылки
+    на Navis. Своя bin/obj в этой подпапке.
+  -->
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="SearchSetRenameLogicTests.cs" />
+    <Compile Include="..\SearchSetRenameLogic.cs" Link="SearchSetRenameLogic.cs" />
+  </ItemGroup>
+</Project>

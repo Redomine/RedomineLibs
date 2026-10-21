@@ -5,6 +5,13 @@
     <Nullable>disable</Nullable>
     <AssemblyName>NavisClashOrder</AssemblyName>
     <RootNamespace>Redomine.NavisClashOrder</RootNamespace>
+    <!--
+      Сборка лежит в общей bin-папке на уровень выше (..\bin\Release\net48\),
+      чтобы обе DLL лежали рядом в одном месте.
+    -->
+    <OutputPath>..\bin\Release\net48\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
 
   <ItemGroup>

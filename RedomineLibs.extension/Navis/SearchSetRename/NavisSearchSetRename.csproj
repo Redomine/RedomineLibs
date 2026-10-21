@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>NavisSearchSetRename</AssemblyName>
+    <RootNamespace>Redomine.NavisSearchSetRename</RootNamespace>
+    <!--
+      Сборка лежит в общей bin-папке основного проекта Navis (../bin/Release/net48/),
+      чтобы DLL всегда находилась рядом с NavisClashOrder.dll и .xml.
+      Obj остаётся в собственной подпапке проекта.
+    -->
+    <OutputPath>..\bin\Release\net48\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Autodesk.Navisworks.Api">
+      <HintPath>C:\Program Files\Autodesk\Navisworks Manage 2024\Autodesk.Navisworks.Api.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <!--
+    Явное перечисление исходников, чтобы ничего лишнего из родительских
+    каталогов случайно не подтянулось.
+  -->
+  <ItemGroup>
+    <Compile Include="SearchSetRenameLogic.cs" />
+    <Compile Include="SearchSetRenamePlugin.cs" />
+  </ItemGroup>
+</Project>
