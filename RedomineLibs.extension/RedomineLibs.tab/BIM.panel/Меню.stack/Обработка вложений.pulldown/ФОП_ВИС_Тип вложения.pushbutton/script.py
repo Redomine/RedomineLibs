@@ -22,7 +22,7 @@ from Autodesk.Revit.DB.Structure import StructuralType
 from pyrevit import forms
 
 
-TITLE = u"ФОП_ВИС_Тип вложения"
+TITLE = u"Загрузить комплектацию"
 PARAMETER_NAME = u"ФОП_ВИС_Тип вложения"
 FAMILY_PATH = (
     u"W:\\Проектный институт\\Отд.стандарт.BIM и RD\\BIM-Ресурсы\\"

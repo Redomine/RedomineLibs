@@ -19,6 +19,7 @@ from Autodesk.Revit.DB import (
     SubTransaction,
     Transaction,
 )
+from Autodesk.Revit.UI import TaskDialog
 from pyrevit import forms
 
 
@@ -26,7 +27,11 @@ TITLE = u"Именовать вложения"
 DEBUG = False
 DESCRIPTION_PARAMETER = u"ФОП_Описание"
 TYPE_DESCRIPTION_PARAMETER = u"ФОП_Описание типа"
-PARENT_MARK_PARAMETER = u"ADSK_Марка"
+TYPE_DESCRIPTION_SOURCES = (
+    u"ADSK_Марка",
+    u"ADSK_Код изделия",
+    u"ADSK_Наименование",
+)
 
 doc = __revit__.ActiveUIDocument.Document
 
@@ -35,6 +40,47 @@ def debug(message):
     if not DEBUG:
         return
     print(u"[Именовать вложения] {}".format(message))
+
+
+def trace_description_parameters(document, element_id, stage):
+    if not DEBUG:
+        return
+    try:
+        instance = document.GetElement(element_id)
+        if not isinstance(instance, FamilyInstance):
+            debug(u"{}: экземпляр ID {} не найден".format(stage, element_id.GetIdValue()))
+            return
+        parameters = list(instance.GetParameters(DESCRIPTION_PARAMETER))
+        debug(
+            u"{}: документ «{}», экземпляр ID {}, параметров «{}»: {}".format(
+                stage, document.Title, element_id.GetIdValue(),
+                DESCRIPTION_PARAMETER, len(parameters),
+            )
+        )
+        for parameter in parameters:
+            debug(
+                u"{}: параметр ID {}, значение {!r}, тип {}, только чтение {}".format(
+                    stage, parameter.Id.GetIdValue(), parameter.AsString(),
+                    parameter.StorageType, parameter.IsReadOnly,
+                )
+            )
+    except Exception as error:
+        debug(u"{}: не удалось прочитать параметр: {}".format(stage, error))
+
+
+def refresh_description_parameter(document, element_id, parameter_id):
+    document.Regenerate()
+    instance = document.GetElement(element_id)
+    if not isinstance(instance, FamilyInstance):
+        raise RuntimeError(u"Экземпляр ID {} стал недоступен.".format(element_id.GetIdValue()))
+    for parameter in instance.GetParameters(DESCRIPTION_PARAMETER):
+        if parameter.Id.GetIdValue() == parameter_id.GetIdValue():
+            return parameter
+    raise RuntimeError(
+        u"Параметр «{}» экземпляра ID {} стал недоступен.".format(
+            DESCRIPTION_PARAMETER, element_id.GetIdValue()
+        )
+    )
 
 
 def alert(message, details=None):
@@ -67,6 +113,20 @@ def family_parameters_by_name(family_document):
     for parameter in family_document.FamilyManager.Parameters:
         result[parameter.Definition.Name] = parameter
     return result
+
+
+def choose_type_description_source(family_document, parameters):
+    family_types = list(family_document.FamilyManager.Types)
+    if len(family_types) < 2:
+        return None
+    for name in TYPE_DESCRIPTION_SOURCES:
+        parameter = parameters.get(name)
+        if parameter is None or parameter.StorageType != StorageType.String:
+            continue
+        values = [family_type.AsString(parameter) for family_type in family_types]
+        if all(value and value.strip() for value in values) and len(set(values)) == len(family_types):
+            return parameter
+    return None
 
 
 def same_shared_parameter(parameter, external_definition):
@@ -127,7 +187,7 @@ def update_nested_family(
     family_document = None
     transaction = None
     family_name = family.Name
-    family_id = family.Id.IntegerValue
+    family_id = family.Id.GetIdValue()
     result = {
         "added": 0,
         "processed": 0,
@@ -170,7 +230,7 @@ def update_nested_family(
                 if nested_family is None or not nested_family.IsValidObject:
                     raise RuntimeError(
                         u"семейство с ID {} стало недоступно".format(
-                            nested_id.IntegerValue
+                            nested_id.GetIdValue()
                         )
                     )
                 nested_result = update_nested_family(
@@ -196,16 +256,12 @@ def update_nested_family(
                 )
 
         own_parameters = family_parameters_by_name(family_document)
-        nested_parent_parameters = {
-            PARENT_MARK_PARAMETER: own_parameters[
-                TYPE_DESCRIPTION_PARAMETER
-            ],
-        }
         unused_updated, unused_grouped, nested_errors = (
             associate_nested_instance_parameters(
                 family_document,
-                nested_parent_parameters,
+                own_parameters[TYPE_DESCRIPTION_PARAMETER],
                 root_family_name,
+                own_parameters[DESCRIPTION_PARAMETER],
             )
         )
         for error in nested_errors:
@@ -238,25 +294,27 @@ def update_nested_family(
                 pass
 
 
-def collect_nested_families(document, instances=None):
-    if instances is None:
-        instances = (
-            FilteredElementCollector(document)
-            .OfClass(FamilyInstance)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        )
+def collect_nested_families(document):
+    instances = (
+        FilteredElementCollector(document)
+        .OfClass(FamilyInstance)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
     result_by_id = {}
     for instance in instances:
         try:
             family = instance.Symbol.Family
-            result_by_id[family.Id.IntegerValue] = family
+            result_by_id[family.Id.GetIdValue()] = family
         except Exception:
             pass
     return sorted(result_by_id.values(), key=lambda item: item.Name.lower())
 
 
-def associate_instance(document, instance, associations, description_value):
+def associate_instance(
+    document, instance, type_description_source, description_value,
+    description_source=None,
+):
     manager = document.FamilyManager
     family_name = instance.Symbol.Family.Name
     debug(
@@ -264,12 +322,13 @@ def associate_instance(document, instance, associations, description_value):
         u"«{}», длина {}".format(
             document.Title,
             family_name,
-            instance.Id.IntegerValue,
+            instance.Id.GetIdValue(),
             description_value,
-            len(description_value) if description_value is not None else -1,
+            len(description_value),
         )
     )
     description = instance.LookupParameter(DESCRIPTION_PARAMETER)
+    trace_description_parameters(document, instance.Id, u"До записи")
     if description is None:
         raise RuntimeError(
             u"параметр «{}» не найден".format(DESCRIPTION_PARAMETER)
@@ -291,50 +350,96 @@ def associate_instance(document, instance, associations, description_value):
             else u"нет",
         )
     )
-    if associated_description is not None:
-        manager.AssociateElementParameterToFamilyParameter(description, None)
-        debug(u"Связь параметра «{}» снята".format(DESCRIPTION_PARAMETER))
-    set_result = description.Set(description_value)
-    debug(
-        u"После записи: Set() вернул {}, значение «{}»".format(
-            set_result, description.AsString()
-        )
-    )
-
-    for nested_name, parent_parameter in associations:
-        element_parameter = instance.LookupParameter(nested_name)
-        if element_parameter is None:
-            raise RuntimeError(u"параметр «{}» не найден".format(nested_name))
-        if element_parameter.StorageType != parent_parameter.StorageType:
+    if description_source is not None:
+        if description.StorageType != description_source.StorageType:
             raise RuntimeError(
                 u"типы параметров «{}» и «{}» не совпадают".format(
-                    nested_name, parent_parameter.Definition.Name
+                    DESCRIPTION_PARAMETER, description_source.Definition.Name,
+                )
+            )
+        if associated_description is None or associated_description.Id != description_source.Id:
+            if associated_description is not None:
+                manager.AssociateElementParameterToFamilyParameter(description, None)
+            if not manager.CanElementParameterBeAssociated(description):
+                raise RuntimeError(
+                    u"параметр «{}» нельзя связать".format(DESCRIPTION_PARAMETER)
+                )
+            manager.AssociateElementParameterToFamilyParameter(
+                description, description_source
+            )
+    else:
+        if associated_description is not None:
+            manager.AssociateElementParameterToFamilyParameter(description, None)
+            debug(u"Связь параметра «{}» снята".format(DESCRIPTION_PARAMETER))
+            description = refresh_description_parameter(
+                document, instance.Id, description.Id
+            )
+        set_result = description.Set(description_value)
+        debug(u"Сразу после Set(): {!r}".format(description.AsString()))
+        description = refresh_description_parameter(document, instance.Id, description.Id)
+        read_value = description.AsString()
+        debug(
+            u"После Regenerate: Set() вернул {}; ожидается {!r}; прочитано {!r}; "
+            u"только чтение {}".format(
+                set_result, description_value, read_value, description.IsReadOnly
+            )
+        )
+        trace_description_parameters(document, instance.Id, u"После Set")
+        if read_value != description_value:
+            raise RuntimeError(
+                u"не удалось записать «{}» в параметр «{}»: Set()={}, "
+                u"прочитано {!r}, только чтение {}".format(
+                    description_value, DESCRIPTION_PARAMETER, set_result,
+                    read_value, description.IsReadOnly,
                 )
             )
 
-        associated = manager.GetAssociatedFamilyParameter(element_parameter)
-        if associated is not None and associated.Id == parent_parameter.Id:
-            continue
-        if not manager.CanElementParameterBeAssociated(element_parameter):
-            raise RuntimeError(
-                u"параметр «{}» нельзя связать".format(nested_name)
-            )
-        manager.AssociateElementParameterToFamilyParameter(
-            element_parameter, parent_parameter
+    type_description = instance.LookupParameter(TYPE_DESCRIPTION_PARAMETER)
+    if type_description is None:
+        raise RuntimeError(
+            u"параметр «{}» не найден".format(TYPE_DESCRIPTION_PARAMETER)
         )
+    if type_description.StorageType != StorageType.String:
+        raise RuntimeError(
+            u"параметр «{}» не является текстовым".format(TYPE_DESCRIPTION_PARAMETER)
+        )
+    associated = manager.GetAssociatedFamilyParameter(type_description)
+    if type_description_source is None:
+        if associated is not None:
+            manager.AssociateElementParameterToFamilyParameter(type_description, None)
+        type_description.Set(u"")
+    else:
+        if type_description.StorageType != type_description_source.StorageType:
+            raise RuntimeError(
+                u"типы параметров «{}» и «{}» не совпадают".format(
+                    TYPE_DESCRIPTION_PARAMETER,
+                    type_description_source.Definition.Name,
+                )
+            )
+        if associated is None or associated.Id != type_description_source.Id:
+            if associated is not None:
+                manager.AssociateElementParameterToFamilyParameter(
+                    type_description, None
+                )
+            if not manager.CanElementParameterBeAssociated(type_description):
+                raise RuntimeError(
+                    u"параметр «{}» нельзя связать".format(
+                        TYPE_DESCRIPTION_PARAMETER
+                    )
+                )
+            manager.AssociateElementParameterToFamilyParameter(
+                type_description, type_description_source
+            )
+    trace_description_parameters(document, instance.Id, u"После обработки типа")
     return True
 
 
 def associate_nested_instance_parameters(
-    document, parent_parameters, description_value
+    document, type_description_source, description_value, description_source=None
 ):
     updated = 0
     grouped = 0
     skipped = []
-    associations = (
-        (TYPE_DESCRIPTION_PARAMETER, parent_parameters[PARENT_MARK_PARAMETER]),
-    )
-
     transaction = Transaction(document, u"Связь параметров вложений")
     transaction.Start()
     try:
@@ -345,12 +450,17 @@ def associate_nested_instance_parameters(
             .ToElements()
         )
         for instance in instances:
+            debug(
+                u"Обход: документ «{}», экземпляр ID {}".format(
+                    document.Title, instance.Id.GetIdValue(),
+                )
+            )
             if instance.GroupId != ElementId.InvalidElementId:
                 grouped += 1
                 debug(
                     u"Документ «{}»: экземпляр ID {} пропущен, так как "
                     u"находится в группе".format(
-                        document.Title, instance.Id.IntegerValue
+                        document.Title, instance.Id.GetIdValue()
                     )
                 )
                 continue
@@ -360,10 +470,14 @@ def associate_nested_instance_parameters(
                 family = instance.Symbol.Family
                 subtransaction.Start()
                 if associate_instance(
-                    document, instance, associations, description_value
+                    document, instance, type_description_source, description_value,
+                    description_source,
                 ):
                     updated += 1
                 subtransaction.Commit()
+                trace_description_parameters(
+                    document, instance.Id, u"После SubTransaction.Commit"
+                )
             except Exception as error:
                 try:
                     subtransaction.RollBack()
@@ -372,16 +486,25 @@ def associate_nested_instance_parameters(
                 skipped.append(
                     u"{} (ID {}): {}".format(
                         family.Name if family is not None else u"Экземпляр",
-                        instance.Id.IntegerValue,
+                        instance.Id.GetIdValue(),
                         error,
                     )
                 )
                 debug(
                     u"Документ «{}»: ошибка экземпляра ID {}: {}".format(
-                        document.Title, instance.Id.IntegerValue, error
+                        document.Title, instance.Id.GetIdValue(), error
                     )
                 )
+                debug(traceback.format_exc())
+                trace_description_parameters(
+                    document, instance.Id, u"После SubTransaction.RollBack"
+                )
         transaction.Commit()
+        debug(u"Транзакция документа «{}» завершена".format(document.Title))
+        for instance in instances:
+            trace_description_parameters(
+                document, instance.Id, u"После Transaction.Commit"
+            )
     except Exception:
         transaction.RollBack()
         raise
@@ -389,92 +512,27 @@ def associate_nested_instance_parameters(
     return updated, grouped, skipped
 
 
-def associate_selected_instance_parameters(
-    document, parent_parameters, selected_ids, description_value
-):
-    updated = 0
-    skipped = []
-    associations = (
-        (TYPE_DESCRIPTION_PARAMETER, parent_parameters[PARENT_MARK_PARAMETER]),
-    )
-
-    transaction = Transaction(document, u"Связь параметров выделенных вложений")
-    transaction.Start()
-    try:
-        for element_id in selected_ids:
-            instance = document.GetElement(element_id)
-            if not isinstance(instance, FamilyInstance):
-                continue
-            if instance.GroupId != ElementId.InvalidElementId:
-                skipped.append(
-                    u"Экземпляр в группе пропущен (ID {}).".format(
-                        element_id.IntegerValue
-                    )
-                )
-                continue
-            family = None
-            subtransaction = SubTransaction(document)
-            try:
-                family = instance.Symbol.Family
-                subtransaction.Start()
-                if associate_instance(
-                    document, instance, associations, description_value
-                ):
-                    updated += 1
-                subtransaction.Commit()
-            except Exception as error:
-                try:
-                    subtransaction.RollBack()
-                except Exception:
-                    pass
-                skipped.append(
-                    u"{} (ID {}): {}".format(
-                        family.Name if family is not None else u"Экземпляр",
-                        element_id.IntegerValue,
-                        error,
-                    )
-                )
-        transaction.Commit()
-    except Exception:
-        transaction.RollBack()
-        raise
-
-    return updated, skipped
-
-
 def main():
+    clr.AddReference("dosymep.Revit.dll")
+    import dosymep
+    clr.ImportExtensions(dosymep.Revit)
+
     if not doc.IsFamilyDocument:
         alert(u"Команда работает только в редакторе семейств.")
         return
 
     root_family = doc.OwnerFamily
     owner_family_name = root_family.Name if root_family is not None else None
-    root_family_name = owner_family_name or doc.Title
+    root_family_name = (owner_family_name or doc.Title or u"").strip()
+    if not root_family_name:
+        alert(u"Не удалось определить имя открытого семейства.")
+        return
     debug(u"========== НАЧАЛО ОТЧЁТА ==========")
     debug(
-        u"Верхнеуровневый документ: «{}»; OwnerFamily: {}; "
-        u"имя для записи: «{}»; длина: {}".format(
-            doc.Title,
-            u"«{}»".format(root_family.Name)
-            if root_family is not None
-            else u"нет",
-            root_family_name,
-            len(root_family_name) if root_family_name is not None else -1,
+        u"Верхнеуровневый документ: «{}»; имя для записи: «{}»".format(
+            doc.Title, root_family_name
         )
     )
-
-    selected_ids = list(
-        __revit__.ActiveUIDocument.Selection.GetElementIds()
-    )
-    selected_instances = []
-    if selected_ids:
-        selected_instances = [
-            doc.GetElement(element_id) for element_id in selected_ids
-            if isinstance(doc.GetElement(element_id), FamilyInstance)
-        ]
-        if not selected_instances:
-            alert(u"Среди выделенных элементов нет вложенных семейств.")
-            return
 
     definitions, missing_definitions = find_shared_definitions(
         doc.Application,
@@ -487,26 +545,16 @@ def main():
         )
         return
 
-    parent_parameters = family_parameters_by_name(doc)
-    missing_parent_parameters = [
-        name
-        for name in (PARENT_MARK_PARAMETER,)
-        if name not in parent_parameters
-    ]
-    if missing_parent_parameters:
-        alert(
-            u"В текущем семействе отсутствуют обязательные параметры:",
-            u"\n".join(missing_parent_parameters),
-        )
-        return
-
-    families = collect_nested_families(
-        doc, selected_instances if selected_ids else None
-    )
+    families = collect_nested_families(doc)
     family_items = [(family.Id, family.Name) for family in families]
     debug(
+        u"Найдено семейств первого уровня: {}".format(
+            u", ".join(name for unused_id, name in family_items) or u"нет"
+        )
+    )
+    debug(
         u"Режим: {}; семейств первого уровня: {}".format(
-            u"выделение" if selected_ids else u"все элементы",
+            u"все элементы",
             len(family_items),
         )
     )
@@ -519,7 +567,7 @@ def main():
             if family is None or not family.IsValidObject:
                 raise RuntimeError(
                     u"семейство с ID {} стало недоступно".format(
-                        family_id.IntegerValue
+                        family_id.GetIdValue()
                     )
                 )
             family_result = update_nested_family(
@@ -539,44 +587,35 @@ def main():
             )
             debug(
                 u"Ошибка семейства первого уровня «{}» (ID {}): {}".format(
-                    family_name, family_id.IntegerValue, error
+                    family_name, family_id.GetIdValue(), error
                 )
             )
 
     try:
         parent_parameters = family_parameters_by_name(doc)
         debug(u"Родительские параметры повторно получены после загрузок")
-        if selected_ids:
-            updated_count, instance_errors = associate_selected_instance_parameters(
-                doc,
-                parent_parameters,
-                selected_ids,
-                root_family_name,
+        type_description_source = choose_type_description_source(
+            doc, parent_parameters
+        )
+        debug(
+            u"Источник описания типа: {}".format(
+                type_description_source.Definition.Name
+                if type_description_source is not None else u"нет"
             )
-            grouped_count = sum(
-                1 for element_id in selected_ids
-                if isinstance(doc.GetElement(element_id), FamilyInstance)
-                and doc.GetElement(element_id).GroupId
-                != ElementId.InvalidElementId
-            )
-        else:
-            updated_count, grouped_count, instance_errors = associate_nested_instance_parameters(
-                doc,
-                parent_parameters,
-                root_family_name,
-            )
+        )
+        updated_count, grouped_count, instance_errors = associate_nested_instance_parameters(
+            doc,
+            type_description_source,
+            root_family_name,
+        )
     except Exception as error:
         alert(
             u"Не удалось связать параметры вложенных экземпляров.",
             traceback.format_exc(),
         )
         return
-    mode_text = (
-        u"Режим: только выделенные элементы.\n"
-        if selected_ids
-        else u"Режим: все вложенные элементы.\n"
-    )
-    summary = mode_text + (
+    summary = (
+        u"Режим: все вложенные элементы.\n"
         u"Обработано вложенных семейств на всех уровнях: {0}.\n"
         u"Семейств первого уровня: {1}.\n"
         u"Добавлено параметров: {2}.\n"
@@ -602,5 +641,7 @@ def main():
     )
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception:
+    TaskDialog.Show(TITLE, traceback.format_exc())
