@@ -11,8 +11,14 @@ import traceback
 
 from System import Activator, AppDomain, DateTime, Environment
 from System.Collections.Generic import List
+from System.IO import FileInfo
 from Autodesk.Revit.UI import RevitCommandId
 from pyrevit import DB, HOST_APP
+
+try:
+    import builtins as builtins_module
+except ImportError:
+    import __builtin__ as builtins_module
 
 
 BRIDGE_ROOT = os.path.join(
@@ -21,6 +27,14 @@ BRIDGE_ROOT = os.path.join(
     "pyrevit-bridge")
 PROCESS_ID = os.getpid()
 PENDING_PATH = os.path.join(BRIDGE_ROOT, "pending-{0}.json".format(PROCESS_ID))
+
+FLOOR_HEATING_LAB_ROOT = os.path.join(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+    "RvtMcp",
+    "floor-heating-lab")
+FLOOR_HEATING_LAB_COMMAND = "floorheatinglab.pushbutton"
+FLOOR_HEATING_LAB_RESULT = os.path.join(
+    FLOOR_HEATING_LAB_ROOT, "result-{0}.json".format(PROCESS_ID))
 
 
 def _read_json(path):
@@ -217,6 +231,61 @@ def _find_loaded_pyrevit_command(script_path):
     return None
 
 
+def _result_signature(path):
+    if not os.path.isfile(path):
+        return None
+    info = FileInfo(path)
+    return "{0}:{1}".format(info.LastWriteTimeUtc.Ticks, info.Length)
+
+
+def _is_floor_heating_lab(command_path):
+    return os.path.basename(command_path).lower() == FLOOR_HEATING_LAB_COMMAND
+
+
+def _execfile(path, globals_dict=None, locals_dict=None):
+    execfile = getattr(builtins_module, "execfile", None)
+    if execfile is not None:
+        execfile(path, globals_dict, locals_dict)
+        return
+    with open(path, "rb") as stream:
+        code = compile(stream.read(), path, "exec")
+    exec(code, globals_dict, locals_dict)
+
+
+def _run_floor_heating_lab_script(script_path):
+    """Run FloorHeatingLab script.py inline instead of relying on PostCommand.
+
+    The button is driven by the request file and only proves success by rewriting
+    result-<pid>.json, so a posted command is not observable. Executing the script
+    here keeps the run synchronous and verifiable without waiting on the UI.
+    """
+    before = _result_signature(FLOOR_HEATING_LAB_RESULT)
+    namespace = {
+        "__revit__": HOST_APP.uiapp,
+        "__file__": script_path,
+        "__name__": "__main__",
+        "__builtins__": builtins_module.__dict__,
+    }
+    _execfile(script_path, namespace)
+    after = _result_signature(FLOOR_HEATING_LAB_RESULT)
+    if after is None:
+        raise RuntimeError(
+            "FloorHeatingLab ran without writing its result file: {0}".format(
+                FLOOR_HEATING_LAB_RESULT))
+    if before is not None and after == before:
+        raise RuntimeError(
+            "FloorHeatingLab ran but did not refresh its result file: {0}".format(
+                FLOOR_HEATING_LAB_RESULT))
+    return {
+        "status": "executed",
+        "commandPath": os.path.abspath(os.path.dirname(script_path)),
+        "scriptPath": script_path,
+        "resultPath": FLOOR_HEATING_LAB_RESULT,
+        "resultStampBefore": before,
+        "resultStampAfter": after,
+    }
+
+
 def _execute_pyrevit_command(request):
     command_path = os.path.abspath(request["commandPath"])
     if not command_path.lower().endswith(".pushbutton") or not os.path.isdir(command_path):
@@ -228,6 +297,12 @@ def _execute_pyrevit_command(request):
         ui_document = HOST_APP.uiapp.ActiveUIDocument
         if ui_document is None or ui_document.Selection.GetElementIds().Count == 0:
             raise RuntimeError("This pyRevit command requires at least one selected element.")
+
+    if _is_floor_heating_lab(command_path):
+        if _find_loaded_pyrevit_command(script_path) is None:
+            raise RuntimeError(
+                "pyRevit did not find a loaded command for commandPath.")
+        return _run_floor_heating_lab_script(script_path)
 
     command = _find_loaded_pyrevit_command(script_path)
     if command is None:
