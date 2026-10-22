@@ -25,8 +25,21 @@ namespace Redomine.NavisClashOrder
 
                 if (!File.Exists(xmlPath))
                 {
-                    Show("Не найден файл:\n" + xmlPath, MessageBoxIcon.Warning);
-                    return 1;
+                    using (var dialog = new OpenFileDialog())
+                    {
+                        dialog.Title = "Укажите файл Clash Detective.xml";
+                        dialog.Filter = "Файлы XML (*.xml)|*.xml|Все файлы (*.*)|*.*";
+                        dialog.FileName = XmlFileName;
+                        dialog.CheckFileExists = true;
+                        dialog.Multiselect = false;
+
+                        if (dialog.ShowDialog() != DialogResult.OK)
+                        {
+                            return 0;
+                        }
+
+                        xmlPath = dialog.FileName;
+                    }
                 }
 
                 Document document = Autodesk.Navisworks.Api.Application.ActiveDocument;

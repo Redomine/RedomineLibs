@@ -17,8 +17,10 @@
    - `NavisSearchSetRename.dll` → `Redomine.SearchSetRename`
 3. Запустите нужный плагин.
 
-Файл `Clash Detective.xml` (для плагина ClashOrder) должен лежать рядом с
-`NavisClashOrder.dll`. При сборке он копируется туда автоматически.
+ClashOrder сначала ищет `Clash Detective.xml` рядом с загруженной DLL. Если
+AddInManager запустил DLL из временной папки и XML там нет, откроется окно
+выбора файла. Укажите `ClashOrder\Clash Detective.xml`; отмена не изменит
+порядок тестов.
 
 ## Сборка
 
