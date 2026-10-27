@@ -78,6 +78,25 @@ class VectorWalkTests(unittest.TestCase):
                                         150, 200, 1, 4, [], "right")
         self.assertEqual(((200, 300), (350, 300)), reservation)
 
+    def test_reservation_uses_forward_before_opposite_turn(self):
+        contour = ((0, 0), (1000, 0), (1000, 1000), (0, 1000))
+        cases = ((False, (200, 300), ((350, 0), (350, 1000))),
+                 (True, (800, 300), ((650, 0), (650, 1000))))
+        for clockwise, point, blocked_side in cases:
+            branch = {"vertices": [point], "segments": [],
+                      "heading": (0, 1)}
+            obstacles = [{"segment": blocked_side,
+                          "kind": "other_branch"}]
+            journal = []
+            reservation = _next_reservation(
+                branch, contour, obstacles, 150, 200, 1, 4,
+                journal, "right", clockwise)
+            self.assertEqual((point, (point[0], point[1] + 150)),
+                             reservation)
+            self.assertEqual("forward", [event["candidate"] for event in
+                                          journal if event["action"] ==
+                                          "reserve_first_turn"][0])
+
     def test_exact_dictating_distance_builds_a_segment(self):
         contour = ((0, 0), (1000, 0), (1000, 1000), (0, 1000))
         branch = {"vertices": [(200, 100), (200, 300)],
@@ -384,6 +403,73 @@ class VectorWalkTests(unittest.TestCase):
                                final_segments if event["branch"] == "left"][0])
         self.assertFalse(any(event["action"] == "recovery_continuation_rollback"
                              for event in journal))
+
+    def test_pair_recovery_tries_straight_between_side_turns(self):
+        polygon = ((0, 3400), (1500, 3400), (1500, 4500),
+                   (2700, 4500), (2700, 3400), (4600, 3400),
+                   (4600, 0), (0, 0))
+        cases = ((polygon, (400, 75), (100, 75), False, "right"),
+                 (tuple((4600 - x, y) for x, y in reversed(polygon)),
+                  (4500, 75), (4200, 75), True, "left"))
+        for contour, right_start, left_start, clockwise, preferred in cases:
+            route = build_vector_route(contour, right_start, left_start,
+                                       (0, 1), 100, clockwise=clockwise)
+            journal = route["journal"]
+            selected = [index for index, event in enumerate(journal) if
+                        event["action"] == "pair_forward_recovery"]
+            self.assertTrue(selected)
+            index = selected[0]
+            probes = [event for event in journal[:index] if
+                      event["action"] == "pair_recovery_checkpoint_probe" and
+                      event["round"] == 11]
+            self.assertTrue(probes)
+            self.assertTrue(all(event["candidate"] == preferred
+                                for event in probes))
+            self.assertEqual("forward", route["rollback"]["turn"])
+            rejected = [position for position, event in enumerate(journal) if
+                        event["action"] == "rejected_dead_end_opening" and
+                        position > index]
+            self.assertTrue(rejected)
+            self.assertTrue(any(event["action"] == "segment" and
+                                event.get("choice") == "forward" and
+                                event.get("length_mm", 0) > 150 and
+                                position > rejected[0]
+                                for position, event in enumerate(journal)))
+            self.assertTrue(route["join"]["connected"])
+
+    def test_clockwise_route_mirrors_counterclockwise_route(self):
+        cases = (
+            (((0, 0), (4000, 0), (4000, 3000), (0, 3000)),
+             (1850, 2925), (2150, 2925), (0, -1), 60),
+            (((0, 0), (2000, 0), (2000, 1500), (0, 1500)),
+             (700, 75), (550, 75), (0, 1), 8),
+            (((0, 3400), (1500, 3400), (1500, 4500),
+              (2700, 4500), (2700, 3400), (4600, 3400),
+              (4600, 0), (0, 0)),
+             (400, 75), (100, 75), (0, 1), 100))
+        for polygon, right_start, left_start, direction, limit in cases:
+            width = max(point[0] for point in polygon)
+            mirror = lambda point: (width - point[0], point[1])
+            mirrored_polygon = tuple(mirror(point) for point in
+                                     reversed(polygon))
+            regular = build_vector_route(polygon, right_start, left_start,
+                                         direction, limit)
+            clockwise = build_vector_route(
+                mirrored_polygon, mirror(left_start), mirror(right_start),
+                (-direction[0], direction[1]), limit, clockwise=True)
+            self.assertEqual(regular["join"]["connected"],
+                             clockwise["join"]["connected"])
+            for side, mirrored_side in (("right", "left"),
+                                        ("left", "right")):
+                self.assertEqual(regular["turns_by_branch"][side],
+                                 clockwise["turns_by_branch"][mirrored_side])
+                vertices = regular["branches"][side]["vertices"]
+                mirrored = clockwise["branches"][mirrored_side]["vertices"]
+                self.assertEqual(len(vertices), len(mirrored))
+                for first, second in zip(vertices, mirrored):
+                    expected = mirror(first)
+                    self.assertAlmostEqual(expected[0], second[0], places=5)
+                    self.assertAlmostEqual(expected[1], second[1], places=5)
 
     def test_tight_pair_continues_when_next_two_turns_are_valid(self):
         polygon = ((0, 0), (6000, 0), (6000, 4200), (0, 4200))

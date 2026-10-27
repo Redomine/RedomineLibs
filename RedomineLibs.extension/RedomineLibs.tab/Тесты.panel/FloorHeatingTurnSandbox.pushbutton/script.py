@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import io
 import json
+import math
 import os
 import sys
 import traceback
@@ -20,6 +21,8 @@ from pyrevit import DB, forms, script
 MM_PER_FOOT = 304.8
 ROOT = os.path.join(os.environ["LOCALAPPDATA"], "RvtMcp",
                     "floor-heating-turn-sandbox")
+SETTINGS_SECTION = "FloorHeatingTurnSandbox"
+SETTINGS_XAML = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                          "..", "..", "..", ".."))
 ENGINE_DIR = os.path.join(REPO_ROOT, "docs", "prototypes",
@@ -29,6 +32,59 @@ if ENGINE_DIR not in sys.path:
 from turn_sandbox import classify_open_ends
 from vector_walk import arrowhead_segments, build_vector_route
 from local_turn_generator import _inside
+
+
+def _saved_bool(value):
+    if isinstance(value, basestring):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+class SettingsWindow(forms.WPFWindow):
+    def __init__(self):
+        forms.WPFWindow.__init__(self, SETTINGS_XAML)
+        self.result = None
+        self.config = script.get_config(SETTINGS_SECTION)
+        clockwise = _saved_bool(getattr(self.config, "clockwise", False))
+        self.clockwise_radio.IsChecked = clockwise
+        self.counterclockwise_radio.IsChecked = not clockwise
+        self.turns_text.Text = str(getattr(self.config, "max_turns", 100))
+        self.offset_text.Text = str(getattr(self.config, "offset_mm", 200))
+        self.spacing_text.Text = str(getattr(self.config, "spacing_mm", 150))
+        self.blue_lines_check.IsChecked = _saved_bool(
+            getattr(self.config, "show_abandoned", False))
+        self.save_journal_check.IsChecked = _saved_bool(
+            getattr(self.config, "save_journal", True))
+
+    def run_click(self, sender, args):
+        try:
+            max_turns = int(self.turns_text.Text.strip())
+            if max_turns < 0:
+                raise ValueError("Число поворотов не может быть отрицательным")
+            offset = float(self.offset_text.Text.strip().replace(",", "."))
+            spacing = float(self.spacing_text.Text.strip().replace(",", "."))
+            if (math.isnan(offset) or math.isinf(offset) or
+                    math.isnan(spacing) or math.isinf(spacing) or
+                    offset < 0 or spacing <= 0):
+                raise ValueError("Отступ должен быть неотрицательным, шаг — больше нуля")
+        except (TypeError, ValueError) as error:
+            forms.alert("Проверьте предел поворотов, отступ и шаг: {0}".format(error),
+                        title="Улитка: настройки")
+            return
+        settings = {"max_turns": max_turns,
+                    "offset_mm": offset,
+                    "spacing_mm": spacing,
+                    "clockwise": bool(self.clockwise_radio.IsChecked),
+                    "show_abandoned": bool(self.blue_lines_check.IsChecked),
+                    "save_journal": bool(self.save_journal_check.IsChecked)}
+        for key, value in settings.items():
+            setattr(self.config, key, value)
+        script.save_config()
+        self.result = settings
+        self.Close()
+
+    def cancel_click(self, sender, args):
+        self.Close()
 
 
 def _point(world, view):
@@ -112,7 +168,7 @@ def _write_log(data):
 
 
 def _draw(document, view, branches, join, abandoned_segments,
-          spacing_mm, min_segment_mm):
+          spacing_mm, min_segment_mm, show_abandoned):
     ids = {"right": [], "left": [], "bridge": [],
            "abandoned": [], "abandoned_arrows": []}
     red_override = DB.OverrideGraphicSettings()
@@ -122,20 +178,21 @@ def _draw(document, view, branches, join, abandoned_segments,
     transaction = DB.Transaction(document, "Улитка: диагностический фрагмент")
     transaction.Start()
     try:
-        for first, second in abandoned_segments:
-            line = DB.Line.CreateBound(_world(first, view), _world(second, view))
-            detail = document.Create.NewDetailCurve(view, line)
-            view.SetElementOverrides(detail.Id, blue_override)
-            ids["abandoned"].append(detail.Id.GetIdValue())
-            arrow_ids = []
-            for wing_start, tip in arrowhead_segments(
-                    first, second, spacing_mm, min_segment_mm):
-                wing = DB.Line.CreateBound(_world(wing_start, view),
-                                           _world(tip, view))
-                arrow = document.Create.NewDetailCurve(view, wing)
-                view.SetElementOverrides(arrow.Id, blue_override)
-                arrow_ids.append(arrow.Id.GetIdValue())
-            ids["abandoned_arrows"].append(arrow_ids)
+        if show_abandoned:
+            for first, second in abandoned_segments:
+                line = DB.Line.CreateBound(_world(first, view), _world(second, view))
+                detail = document.Create.NewDetailCurve(view, line)
+                view.SetElementOverrides(detail.Id, blue_override)
+                ids["abandoned"].append(detail.Id.GetIdValue())
+                arrow_ids = []
+                for wing_start, tip in arrowhead_segments(
+                        first, second, spacing_mm, min_segment_mm):
+                    wing = DB.Line.CreateBound(_world(wing_start, view),
+                                               _world(tip, view))
+                    arrow = document.Create.NewDetailCurve(view, wing)
+                    view.SetElementOverrides(arrow.Id, blue_override)
+                    arrow_ids.append(arrow.Id.GetIdValue())
+                ids["abandoned_arrows"].append(arrow_ids)
         for side in ("right", "left"):
             vertices = branches[side]["vertices"]
             for first, second in zip(vertices, vertices[1:]):
@@ -164,19 +221,14 @@ def main():
     uidoc = __revit__.ActiveUIDocument
     document = uidoc.Document
     view = uidoc.ActiveView
-    region, selection_method = _choose_region(uidoc)
-    clockwise = False
-    raw_limit = forms.ask_for_string(default="100",
-                                     prompt="Сколько поворотов разрешено сделать? (0 или больше)",
-                                     title="Улитка: предел поворотов")
-    if raw_limit is None:
+    window = SettingsWindow()
+    window.ShowDialog()
+    if window.result is None:
         return
-    try:
-        limit = int(raw_limit.strip())
-    except (TypeError, ValueError):
-        raise ValueError("Число поворотов должно быть целым")
-    if limit < 0:
-        raise ValueError("Число поворотов не может быть отрицательным")
+    settings = window.result
+    region, selection_method = _choose_region(uidoc)
+    clockwise = settings["clockwise"]
+    limit = settings["max_turns"]
     polygon = _polygon(region, view)
     ends = _free_ends(document, view, polygon)
     if len(ends) != 2:
@@ -185,6 +237,8 @@ def main():
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
     route = build_vector_route(polygon, right_end["point"],
                                left_end["point"], direction, limit,
+                               offset_mm=settings["offset_mm"],
+                               spacing_mm=settings["spacing_mm"],
                                min_segment_mm=minimum_curve_mm,
                                clockwise=clockwise)
     run_id = str(uuid.uuid4())
@@ -197,16 +251,17 @@ def main():
                           for item in ends],
             "entry_direction": list(direction), "pipe_separation_mm": separation,
             "clockwise": clockwise,
+            "settings": settings,
             "right_pipe_id": right_end["pipe_id"],
             "left_pipe_id": left_end["pipe_id"],
             "route": route, "line_ids": {"right": [], "left": [],
                                            "bridge": [], "abandoned": [],
                                            "abandoned_arrows": []}}
-    path = _write_log(data)
+    path = _write_log(data) if settings["save_journal"] else None
     data["line_ids"] = _draw(document, view, route["branches"],
                              route["join"], route["abandoned_segments"],
-                             route["journal"][0]["spacing_mm"],
-                             minimum_curve_mm)
+                             settings["spacing_mm"], minimum_curve_mm,
+                             settings["show_abandoned"])
     blue_events = [event for event in route["journal"] if
                    event["action"] == "abandoned_segment"]
     for event, element_id, arrow_ids in zip(
@@ -214,11 +269,15 @@ def main():
             data["line_ids"]["abandoned_arrows"]):
         event["element_id"] = element_id
         event["arrow_element_ids"] = arrow_ids
-    _write_log(data)
+    if settings["save_journal"]:
+        _write_log(data)
     output = script.get_output()
     output.print_md("**Улитка: песочница**")
     print("Порядок проверки направлений: {0}".format(
         "влево, прямо, вправо" if clockwise else "вправо, прямо, влево"))
+    print("Отступ: {0:g} мм; шаг: {1:g} мм; синие линии: {2}".format(
+        settings["offset_mm"], settings["spacing_mm"],
+        "включены" if settings["show_abandoned"] else "выключены"))
     print("Область: {0}; правая: {1}/{2} ({3}), левая: {4}/{2} ({5}) поворотов".format(
         data["region_id"], route["turns_by_branch"]["right"], limit,
         route["branches"]["right"]["stop_reason"],
@@ -244,7 +303,7 @@ def main():
             print("Возврат парного маршрута: шаг {0} -> шаг {1}".format(
                 route["rollback"]["from_round"],
                 route["rollback"]["to_round"]))
-    print("Журнал: {0}".format(path))
+    print("Журнал: {0}".format(path if path else "сохранение выключено"))
 
 
 try:

@@ -31,6 +31,14 @@ def _directions(heading, clockwise=False):
     return (primary, ("forward", heading), secondary)
 
 
+def _same_obstacle_segment(first, second):
+    if first is None or second is None:
+        return False
+    return (all(_distance(a, b) <= TOLERANCE for a, b in zip(first, second)) or
+            all(_distance(a, b) <= TOLERANCE for a, b in
+                zip(first, reversed(second))))
+
+
 def _can_travel(available, required, min_segment):
     return (available > min_segment + TOLERANCE and
             available + TOLERANCE >= required)
@@ -230,7 +238,7 @@ def _paired_next_step_available(branches, first_side, second_side,
     join = {"connected": False, "reason": "incomplete_pair"}
     if first_moved and second_moved:
         join = _finish_route(copy.deepcopy(trial), contour, spacing,
-                             min_segment, probe_log)
+                             min_segment, probe_log, first_side)
     moves = [event for event in probe_log if event["action"] == "segment"]
     _record(journal, "pair_next_step_probe", round=round_index + 1,
             first_moved=first_moved, second_moved=second_moved,
@@ -262,7 +270,8 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
     equal_turns = (trial[first_side]["turns_used"] ==
                    trial[second_side]["turns_used"])
     if first_moved and second_moved and equal_turns:
-        join = _finish_route(trial, contour, spacing, min_segment, probe_log)
+        join = _finish_route(trial, contour, spacing, min_segment,
+                             probe_log, first_side)
     accepted = first_moved and second_moved and equal_turns and join["connected"]
     _record(journal, "terminal_pair_probe", round=round_index + 1,
             first_moved=first_moved, second_moved=second_moved,
@@ -284,16 +293,19 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
 def _next_reservation(branch, contour, other_obstacles, spacing, offset,
                       min_segment, max_turns, journal, side, clockwise=False):
     point = branch["vertices"][-1]
-    candidates = (("left", _left(branch["heading"])) if clockwise else
-                  ("right", _right(branch["heading"])),
-                  ("right", _right(branch["heading"])) if clockwise else
-                  ("left", _left(branch["heading"])),
-                  ("forward", branch["heading"]))
+    candidates = _directions(branch["heading"], clockwise)
     for name, direction in candidates:
         result = probe_ray(point, direction, contour, branch["segments"],
                            other_obstacles, spacing)
         _record(journal, "reservation_probe", branch=side,
                 candidate=name, at=list(point), result=result)
+        if (name == candidates[0][0] and
+                _same_obstacle_segment(
+                    result.get("blocker_segment"),
+                    branch.get("rejected_primary_obstacle"))):
+            _record(journal, "reservation_rejected_dead_end_opening",
+                    branch=side, candidate=name, at=list(point))
+            continue
         required = offset if result["blocker"] == "boundary" else spacing
         if _can_travel(result["available_mm"], required, min_segment):
             length = min(spacing, result["available_mm"])
@@ -358,6 +370,15 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
         _record(journal, "direction_probe", branch=side,
                 round=round_index, candidate=name, at=list(point),
                 result=result)
+        avoided = branch.get("rejected_primary_obstacle")
+        primary_name = _directions(branch["heading"], clockwise)[0][0]
+        if name == primary_name and avoided is not None:
+            if _same_obstacle_segment(result.get("blocker_segment"), avoided):
+                _record(journal, "rejected_dead_end_opening", branch=side,
+                        round=round_index, candidate=name,
+                        at=list(point), blocker_segment=avoided)
+                continue
+            branch["rejected_primary_obstacle"] = None
         required = offset if result["blocker"] == "boundary" else spacing
         if not _can_travel(result["available_mm"], required, min_segment):
             _record(journal, "direction_rejected", branch=side,
@@ -384,6 +405,17 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                 side_probe = probe_ray(sample, turn_direction, contour,
                                       trial_segments, other_obstacles,
                                       spacing)
+                avoided = branch.get("rejected_primary_obstacle")
+                if (name == "forward" and turn_name == primary_name and
+                        avoided is not None):
+                    if _same_obstacle_segment(
+                            side_probe.get("blocker_segment"), avoided):
+                        _record(journal, "rejected_dead_end_opening",
+                                branch=side, round=round_index,
+                                candidate=turn_name, at=list(sample),
+                                blocker_segment=avoided)
+                        continue
+                    branch["rejected_primary_obstacle"] = None
                 side_required = (offset if side_probe["blocker"] == "boundary"
                                  else spacing)
                 available = _can_travel(side_probe["available_mm"],
@@ -515,7 +547,8 @@ def _valid_join(right, left, bridge, contour, spacing, min_segment):
     return True, None
 
 
-def _finish_route(branches, contour, spacing, min_segment, journal):
+def _finish_route(branches, contour, spacing, min_segment, journal,
+                  first_side="right"):
     right = list(branches["right"]["vertices"])
     left = list(branches["left"]["vertices"])
     if len(right) < 2 or len(left) < 2:
@@ -539,9 +572,12 @@ def _finish_route(branches, contour, spacing, min_segment, journal):
                             (re, (le[0], re[1]))),
                            ("align_to_second", (re[0], le[1]), le,
                             ((re[0], le[1]), le))))
+    preferred_alignment = ("align_to_first" if first_side == "right" else
+                           "align_to_second")
     candidates.sort(key=lambda item: (_distance(re, item[1]) +
                                       _distance(le, item[2]) +
-                                      (_distance(*item[3]) if item[3] else 0.0)))
+                                      (_distance(*item[3]) if item[3] else 0.0),
+                                      0 if item[0] == preferred_alignment else 1))
     for name, right_end, left_end, bridge in candidates:
         proposed_right = right[:-1] + [right_end]
         proposed_left = left[:-1] + [left_end]
@@ -700,10 +736,10 @@ def _recovery_checkpoints(original, first_side, contour, spacing,
     return unique
 
 
-def _recover_pair_turn(snapshots, first_side, second_side, contour,
+def _recover_pair_side(snapshots, first_side, second_side, contour,
                        spacing, offset, min_segment, max_turns,
-                       clockwise, journal, minimum_turn_room=None,
-                       excluded=None):
+                       clockwise, journal, allowed_turn,
+                       minimum_turn_room=None, excluded=None):
     for snapshot in reversed(snapshots):
         original = snapshot["branches"]
         first_segment = original[first_side]["segments"][-1]
@@ -740,6 +776,8 @@ def _recover_pair_turn(snapshots, first_side, second_side, contour,
             second_point = _advance(second_segment[0], second_heading,
                                     second_distance)
             for turn_name, turn_direction in (side_order[0], side_order[2]):
+                if turn_name != allowed_turn:
+                    continue
                 if (checkpoint["turn"] is not None and
                         checkpoint["turn"] != turn_name):
                     continue
@@ -812,7 +850,7 @@ def _recover_pair_turn(snapshots, first_side, second_side, contour,
                     continue
                 join_trial = copy.deepcopy(trial)
                 join = _finish_route(join_trial, contour, spacing,
-                                     min_segment, probe_log)
+                                     min_segment, probe_log, first_side)
                 if not join["connected"]:
                     continue
                 details = {"from_round": snapshot["round"],
@@ -836,6 +874,108 @@ def _recover_pair_turn(snapshots, first_side, second_side, contour,
                             **event)
                 return trial, join, details
     _record(journal, "pair_turn_recovery_unavailable")
+    return None, None, None
+
+
+def _recover_pair_forward(snapshot, first_side, second_side, contour,
+                          spacing, offset, min_segment, max_turns,
+                          clockwise, journal, excluded):
+    key = (snapshot["round"], "forward")
+    if excluded is not None and key in excluded:
+        return None, None, None
+    trial = copy.deepcopy(snapshot["branches"])
+    first = trial[first_side]
+    second = trial[second_side]
+    if (first["turns_used"] >= max_turns or
+            second["turns_used"] >= max_turns):
+        return None, None, None
+    first["stop_reason"] = None
+    second["stop_reason"] = None
+    first["pending_turn"] = "forward"
+    second["pending_turn"] = "forward"
+    probe_log = []
+    first_moved = _walk_one(
+        first, first_side, contour, _obstacles(second, "other_branch"),
+        spacing, offset, min_segment, max_turns, probe_log,
+        snapshot["round"] + 1, clockwise)
+    second_moved = False
+    if first_moved:
+        reservation = _next_reservation(
+            first, contour, _obstacles(second, "other_branch"),
+            spacing, offset, min_segment, max_turns, probe_log,
+            first_side, clockwise)
+        obstacles = _obstacles(first, "other_branch")
+        if reservation is not None:
+            obstacles.append({"segment": reservation,
+                              "kind": "first_turn_reservation"})
+        second_moved = _walk_one(
+            second, second_side, contour, obstacles, spacing, offset,
+            min_segment, max_turns, probe_log,
+            snapshot["round"] + 1, clockwise)
+    moves = [event for event in probe_log if event["action"] == "segment"]
+    parallel_forward = (first_moved and second_moved and len(moves) == 2 and
+                        all(event["choice"] == "forward" for event in moves))
+    join = {"connected": False, "reason": "incomplete_pair"}
+    if parallel_forward:
+        join = _finish_route(copy.deepcopy(trial), contour, spacing,
+                             min_segment, probe_log, first_side)
+    _record(journal, "pair_forward_recovery_probe",
+            from_round=snapshot["round"],
+            first_moved=first_moved, second_moved=second_moved,
+            choices={event["branch"]: event["choice"] for event in moves},
+            connected=join["connected"])
+    if not parallel_forward or not join["connected"]:
+        return None, None, None
+    details = {"from_round": snapshot["round"],
+               "to_round": snapshot["round"] + 1,
+               "turn": "forward", "reason": "paired_forward_recovery"}
+    for side, other_side in ((first_side, second_side),
+                             (second_side, first_side)):
+        previous = snapshot["branches"][side]
+        prior_obstacles = _obstacles(snapshot["branches"][other_side],
+                                    "other_branch")
+        primary_name, primary_direction = _directions(
+            previous["heading"], clockwise)[0]
+        rejected = probe_ray(previous["vertices"][-1], primary_direction,
+                             contour, previous["segments"], prior_obstacles,
+                             spacing)
+        trial[side]["rejected_primary_obstacle"] = rejected.get(
+            "blocker_segment")
+        _record(journal, "rejected_opening_saved", branch=side,
+                candidate=primary_name,
+                at=list(previous["vertices"][-1]), result=rejected)
+    _record(journal, "pair_forward_recovery", **details)
+    if excluded is not None:
+        excluded.add(key)
+    for event in probe_log:
+        event = dict(event)
+        event.pop("step", None)
+        _record(journal, "recovery_" + event.pop("action"), **event)
+    return trial, join, details
+
+
+def _recover_pair_turn(snapshots, first_side, second_side, contour,
+                       spacing, offset, min_segment, max_turns,
+                       clockwise, journal, minimum_turn_room=None,
+                       excluded=None):
+    if not snapshots:
+        return None, None, None
+    heading = snapshots[-1]["branches"][first_side]["heading"]
+    order = [item[0] for item in _directions(heading, clockwise)]
+    for snapshot in reversed(snapshots):
+        for choice in order:
+            if choice == "forward":
+                result = _recover_pair_forward(
+                    snapshot, first_side, second_side, contour, spacing,
+                    offset, min_segment, max_turns, clockwise, journal,
+                    excluded)
+            else:
+                result = _recover_pair_side(
+                    [snapshot], first_side, second_side, contour, spacing,
+                    offset, min_segment, max_turns, clockwise, journal,
+                    choice, minimum_turn_room, excluded)
+            if result[0] is not None:
+                return result
     return None, None, None
 
 
@@ -917,7 +1057,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
     latest_recovery = None
     joined_trial = copy.deepcopy(branches)
     last_join = _finish_route(joined_trial, contour, spacing,
-                              min_segment, journal)
+                              min_segment, journal, first_side)
     last_vertices = {side: list(joined_trial[side]["vertices"])
                      for side in ("right", "left")}
     last_turns = {side: branches[side]["turns_used"]
@@ -941,7 +1081,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 _record(journal, event.pop("action"), **event)
             joined_trial = copy.deepcopy(branches)
             candidate_join = _finish_route(joined_trial, contour, spacing,
-                                           min_segment, journal)
+                                           min_segment, journal, first_side)
             if candidate_join["connected"]:
                 last_join = candidate_join
                 last_vertices = {side: list(joined_trial[side]["vertices"])
@@ -978,7 +1118,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                               "branches": copy.deepcopy(branches)})
         trial = copy.deepcopy(branches)
         candidate_join = _finish_route(trial, contour, spacing,
-                                       min_segment, journal)
+                                       min_segment, journal, first_side)
         _record(journal, "recovery_continuation", round=round_index,
                 first_moved=first_moved, second_moved=second_moved,
                 connected=candidate_join["connected"])
@@ -1019,14 +1159,15 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 spacing, offset, min_segment, max_turns, clockwise,
                 journal, excluded=used_recoveries)
             if recovered is not None:
-                for side in ("right", "left"):
-                    recovered[side]["returning_from_protrusion"] = inbound_headings[side]
+                if details["turn"] != "forward":
+                    for side in ("right", "left"):
+                        recovered[side]["returning_from_protrusion"] = inbound_headings[side]
                 branches.clear()
                 branches.update(recovered)
                 snapshots = []
                 joined_trial = copy.deepcopy(branches)
                 last_join = _finish_route(joined_trial, contour, spacing,
-                                          min_segment, journal)
+                                          min_segment, journal, first_side)
                 last_vertices = {side: list(joined_trial[side]["vertices"])
                                  for side in ("right", "left")}
                 last_turns = {side: branches[side]["turns_used"]
@@ -1048,7 +1189,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                         second_moved=second_moved)
             break
     final_join = _finish_route(branches, contour, spacing,
-                               min_segment, journal)
+                               min_segment, journal, first_side)
     if final_join["connected"] and not pair_diverged:
         return final_join, latest_recovery
     if last_join["connected"]:
@@ -1137,7 +1278,7 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
         trial = {side: {"vertices": list(branches[side]["vertices"])}
                  for side in ("right", "left")}
         checkpoint_join = _finish_route(trial, contour, spacing_mm,
-                                        min_segment_mm, journal)
+                                        min_segment_mm, journal, first_side)
         _record(journal, "pair_checkpoint_probe", round=round_index,
                 first_moved=first_moved, second_moved=second_moved,
                 connected=checkpoint_join["connected"],
@@ -1187,8 +1328,9 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
                 spacing_mm, offset_mm, min_segment_mm, max_turns,
                 clockwise, journal)
             if recovered is not None:
-                for side in ("right", "left"):
-                    recovered[side]["returning_from_protrusion"] = inbound_headings[side]
+                if details["turn"] != "forward":
+                    for side in ("right", "left"):
+                        recovered[side]["returning_from_protrusion"] = inbound_headings[side]
                 early_recovery = (recovered, recovered_join, details)
                 _record(journal, "paired_turn_room_recovery_selected",
                         round=round_index, tight_branches=tight_sides,
@@ -1220,7 +1362,7 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
             rollback = continued_rollback
     else:
         join = _finish_route(branches, contour, spacing_mm,
-                             min_segment_mm, journal)
+                             min_segment_mm, journal, first_side)
     if not join["connected"]:
         recovered, recovered_join, rollback = _recover_pair_turn(
             pair_snapshots, first_side, second_side, contour, spacing_mm,
