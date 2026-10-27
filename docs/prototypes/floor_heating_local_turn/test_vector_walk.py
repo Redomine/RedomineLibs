@@ -6,11 +6,78 @@ import unittest
 from vector_walk import (_abandoned_segments, _can_travel, _finish_route,
                          _intermediate_checkpoints, _next_reservation,
                          _recovery_checkpoints,
-                         _paired_turn_room, _recovery_distance_allowed, _walk_one,
-                         arrowhead_segments, build_vector_route, probe_ray)
+                         _paired_turn_room, _recovery_distance_allowed,
+                         _sequential_jog_without_parallel_overlap, _walk_one,
+                         arrowhead_segments, build_vector_route,
+                         limit_route_length, probe_ray, route_length_mm)
 
 
 class VectorWalkTests(unittest.TestCase):
+    def test_length_limit_counts_both_branches_and_keeps_complete_pair(self):
+        route = {
+            "branches": {
+                "right": {"vertices": [(0, 0), (100, 0), (200, 0)],
+                          "turns_used": 0, "stop_reason": None},
+                "left": {"vertices": [(0, 150), (100, 150), (200, 150)],
+                         "turns_used": 0, "stop_reason": None}},
+            "journal": [], "turns_by_branch": {"right": 0, "left": 0},
+            "turns_used": 0, "stop_reason": {"right": None, "left": None},
+            "join": {"connected": True, "bridge": [[200, 0], [200, 150]]},
+            "rollback": None, "abandoned_segments": []}
+        limited = limit_route_length(route, 250.0)
+        self.assertTrue(limited["length_limit_hit"])
+        self.assertEqual(200.0, limited["length_mm"])
+        self.assertEqual(200.0, route_length_mm(limited["branches"]))
+        self.assertEqual([(0, 0), (100, 0)],
+                         limited["branches"]["right"]["vertices"])
+        self.assertEqual([(0, 150), (100, 150)],
+                         limited["branches"]["left"]["vertices"])
+        self.assertFalse(limited["join"]["connected"])
+        self.assertEqual("length_limit_reached",
+                         limited["journal"][-1]["action"])
+        self.assertTrue(route["join"]["connected"])
+        complete = limit_route_length(route, 400.0)
+        self.assertFalse(complete["length_limit_hit"])
+        self.assertEqual(400.0, complete["length_mm"])
+
+    def test_clockwise_entry_near_wall_aligns_both_pipes(self):
+        polygon = ((3600, 0), (0, 0), (0, 4900), (900, 4900),
+                   (900, 5900), (3050, 5900), (3050, 4900),
+                   (3600, 4900), (3600, 3500), (4600, 3500),
+                   (4600, 1700), (3600, 1700))
+        route = build_vector_route(polygon, (415, 75), (115, 75),
+                                   (0, 1), 100, clockwise=True)
+        aligned = [event for event in route["journal"] if
+                   event["action"] == "paired_entry_alignment"]
+        self.assertEqual(1, len(aligned))
+        self.assertEqual([200, 200], aligned[0]["first_target"])
+        self.assertEqual([350, 350], aligned[0]["second_target"])
+        self.assertEqual((115, 75), route["branches"]["left"]["vertices"][0])
+        self.assertEqual((200, 75), route["branches"]["left"]["vertices"][1])
+        self.assertEqual((415, 75), route["branches"]["right"]["vertices"][0])
+        self.assertEqual((350, 75), route["branches"]["right"]["vertices"][1])
+        first_pipe_x = route["branches"]["right"]["vertices"][1][0]
+        returning = []
+        left_vertices = route["branches"]["left"]["vertices"]
+        for start, end in zip(left_vertices[1:], left_vertices[2:]):
+            if (abs(start[0] - end[0]) < 0.001 and
+                    start[0] > first_pipe_x and
+                    min(start[1], end[1]) <= 200 and
+                    max(start[1], end[1]) > 200):
+                returning.append(start[0] - first_pipe_x)
+        self.assertTrue(returning)
+        self.assertAlmostEqual(150, min(returning))
+        self.assertTrue(route["join"]["connected"])
+        self.assertEqual(route["turns_by_branch"]["left"],
+                         route["turns_by_branch"]["right"])
+        self.assertGreater(route["turns_by_branch"]["left"], 1)
+
+    def test_entry_jog_exemption_requires_no_parallel_overlap(self):
+        self.assertTrue(_sequential_jog_without_parallel_overlap(
+            ((0, 0), (0, 100)), ((50, 100), (50, 200))))
+        self.assertFalse(_sequential_jog_without_parallel_overlap(
+            ((0, 0), (0, 200)), ((50, 200), (50, 0))))
+
     def test_recovery_uses_boundary_endpoint_but_leaves_pipe_margin(self):
         self.assertTrue(_recovery_distance_allowed(600, 600,
                                                    "boundary", 1))
@@ -224,36 +291,43 @@ class VectorWalkTests(unittest.TestCase):
                      event["branch"] == "right" and event["round"] == 2]
         self.assertEqual(["right", "forward", "left"], round_two)
 
-    def test_close_to_side_wall_uses_forward_fallback(self):
+    def test_built_entry_reaches_offset_before_spiral(self):
         polygon = ((0, 0), (4000, 0), (4000, 3000), (0, 3000))
         route = build_vector_route(polygon, (400, 75), (100, 75),
                                    (0, 1), 3)
-        second = [event for event in route["journal"]
-                  if event["action"] == "segment" and
-                  event["branch"] == "left"]
-        self.assertEqual("forward", second[0]["choice"])
+        self.assertEqual((400, 75), route["branches"]["right"]["vertices"][0])
+        self.assertEqual((400, 200), route["branches"]["right"]["vertices"][1])
+        self.assertEqual((100, 75), route["branches"]["left"]["vertices"][0])
+        self.assertEqual((250, 75), route["branches"]["left"]["vertices"][1])
+        self.assertEqual((250, 350), route["branches"]["left"]["vertices"][2])
+        built = [event for event in route["journal"] if
+                 event["action"] == "entry_segment"]
+        self.assertEqual({"right", "left"},
+                         {event["branch"] for event in built})
         self.assertEqual({"right": 3, "left": 3}, route["turns_by_branch"])
 
     def test_second_branch_keeps_first_turn_space_at_turn_limit(self):
         polygon = ((0, 0), (4000, 0), (4000, 3000), (0, 3000))
         route = build_vector_route(polygon, (400, 75), (100, 75),
                                    (0, 1), 4)
-        first_end = route["branches"]["right"]["vertices"][-1]
         reservations = [event for event in route["journal"]
                         if event["action"] == "reserve_first_turn"]
         self.assertEqual("left", reservations[-1]["candidate"])
-        self.assertEqual(list(first_end), reservations[-1]["start"])
+        self.assertIn(tuple(reservations[-1]["start"]),
+                      route["branches"]["right"]["vertices"])
+        self.assertTrue(route["join"]["connected"])
 
-    def test_entry_direction_change_counts_as_turn(self):
+    def test_built_entry_jog_does_not_use_spiral_turn_limit(self):
         polygon = ((0, 0), (4000, 0), (4000, 3000), (0, 3000))
         route = build_vector_route(polygon, (400, 75), (100, 75),
                                    (0, 1), 4)
         entry_turns = [event for event in route["journal"]
                        if event["action"] == "entry_turn"]
         self.assertEqual(["left"], [event["branch"] for event in entry_turns])
+        self.assertFalse(entry_turns[0]["counted_in_walk"])
         self.assertEqual({"right": 4, "left": 4}, route["turns_by_branch"])
         self.assertEqual(5, len(route["branches"]["right"]["vertices"]) - 1)
-        self.assertEqual(5, len(route["branches"]["left"]["vertices"]) - 1)
+        self.assertEqual(6, len(route["branches"]["left"]["vertices"]) - 1)
 
     def test_parallel_ends_are_joined_by_adjusting_last_leg(self):
         contour = ((0, 0), (1000, 0), (1000, 1000), (0, 1000))

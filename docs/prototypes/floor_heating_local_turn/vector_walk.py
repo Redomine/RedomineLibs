@@ -17,6 +17,78 @@ def _record(journal, action, **details):
     journal.append(event)
 
 
+def route_length_mm(branches):
+    """Total visible length of both branches, excluding the final bridge."""
+    return sum(_distance(first, second)
+               for side in ("right", "left")
+               for first, second in zip(branches[side]["vertices"],
+                                        branches[side]["vertices"][1:]))
+
+
+def limit_route_length(route, max_total_length_mm):
+    """Keep the longest complete paired prefix that fits the length limit."""
+    if (math.isnan(max_total_length_mm) or math.isinf(max_total_length_mm) or
+            max_total_length_mm <= 0):
+        raise ValueError("max_total_length_must_be_positive_and_finite")
+    full_length = route_length_mm(route["branches"])
+    route["length_limit_mm"] = max_total_length_mm
+    if full_length <= max_total_length_mm + TOLERANCE:
+        route["length_mm"] = full_length
+        route["length_limit_hit"] = False
+        return route
+    vertices = {side: route["branches"][side]["vertices"]
+                for side in ("right", "left")}
+    kept = {side: list(vertices[side][:1]) for side in ("right", "left")}
+    current_length = 0.0
+    rejected_length = 0.0
+    for index in range(max(len(vertices["right"]), len(vertices["left"])) - 1):
+        pair = []
+        for side in ("right", "left"):
+            if index + 1 < len(vertices[side]):
+                pair.append((side, vertices[side][index + 1],
+                             _distance(vertices[side][index],
+                                       vertices[side][index + 1])))
+        pair_length = sum(item[2] for item in pair)
+        if current_length + pair_length > max_total_length_mm + TOLERANCE:
+            rejected_length = pair_length
+            break
+        for side, point, length in pair:
+            kept[side].append(point)
+        current_length += pair_length
+    limited = copy.deepcopy(route)
+    for side in ("right", "left"):
+        limited["branches"][side]["vertices"] = kept[side]
+        limited["branches"][side]["stop_reason"] = "length_limit"
+        directions = []
+        for first, second in zip(kept[side], kept[side][1:]):
+            length = _distance(first, second)
+            if length > TOLERANCE:
+                directions.append(((second[0] - first[0]) / length,
+                                   (second[1] - first[1]) / length))
+        turns = sum(1 for first, second in zip(directions, directions[1:])
+                    if abs(first[0] * second[1] -
+                           first[1] * second[0]) > TOLERANCE)
+        entry_turns = sum(1 for event in limited["journal"]
+                          if event["action"] == "entry_turn" and
+                          event["branch"] == side)
+        turns = max(0, turns - entry_turns)
+        limited["branches"][side]["turns_used"] = turns
+        limited["turns_by_branch"][side] = turns
+        limited["stop_reason"][side] = "length_limit"
+    limited["turns_used"] = sum(limited["turns_by_branch"].values())
+    limited["join"] = {"connected": False, "reason": "length_limit"}
+    limited["rollback"] = None
+    limited["abandoned_segments"] = []
+    limited["length_mm"] = current_length
+    limited["full_length_mm"] = full_length
+    limited["length_limit_hit"] = True
+    _record(limited["journal"], "length_limit_reached",
+            limit_mm=max_total_length_mm, built_length_mm=current_length,
+            rejected_pair_length_mm=rejected_length,
+            full_route_length_mm=full_length)
+    return limited
+
+
 def _right(direction):
     return (direction[1], -direction[0])
 
@@ -118,23 +190,75 @@ def probe_ray(point, direction, contour, own_segments, other_obstacles,
             "boundary_hit": list(_advance(point, direction, boundary_limit))}
 
 
+def _paired_entry_alignment(polygon, contour, starts, normal, first_side,
+                            second_side, offset, spacing, clockwise,
+                            journal):
+    first_entry = _entry_at_depth(polygon, starts[first_side], normal, offset)
+    second_entry = _entry_at_depth(
+        polygon, starts[second_side], normal, offset + spacing)
+    if _inside(first_entry, contour) and _inside(second_entry, contour):
+        return {}
+    primary = _directions(normal, clockwise)[0][1]
+    inward = (-primary[0], -primary[1])
+    cross = 0 if abs(normal[1]) > TOLERANCE else 1
+    along = 1 - cross
+    candidates = []
+    for a, b in zip(contour, contour[1:] + contour[:1]):
+        if abs(a[cross] - b[cross]) > TOLERANCE:
+            continue
+        if not (min(a[along], b[along]) - TOLERANCE <=
+                first_entry[along] <=
+                max(a[along], b[along]) + TOLERANCE):
+            continue
+        distance = (a[cross] - first_entry[cross]) * inward[cross]
+        if distance < -TOLERANCE:
+            continue
+        point = list(first_entry)
+        point[cross] = a[cross]
+        if _inside(point, contour):
+            candidates.append((max(0.0, distance), tuple(point)))
+    if _inside(first_entry, contour):
+        first_target = first_entry
+    else:
+        if not candidates:
+            raise ValueError("entry_has_no_offset_contour_on_inward_side")
+        first_target = min(candidates, key=lambda item: item[0])[1]
+    second_target = list(second_entry)
+    second_target[cross] = first_target[cross] + inward[cross] * spacing
+    second_target = tuple(second_target)
+    if not _inside(second_target, contour):
+        raise ValueError("paired_entry_spacing_outside_offset_contour")
+    _record(journal, "paired_entry_alignment",
+            first_branch=first_side, second_branch=second_side,
+            first_raw=list(first_entry), first_target=list(first_target),
+            second_raw=list(second_entry), second_target=list(second_target),
+            spacing_mm=spacing)
+    return {first_side: first_target, second_side: second_target}
+
+
 def _initial_branch(polygon, contour, start, normal, depth, spacing,
-                    side, journal):
+                    side, journal, corrected_override=None):
     entry = _entry_at_depth(polygon, start, normal, depth)
-    corrected = _correct_entry(entry, normal, contour, spacing)
-    _record(journal, "entry", branch=side, start=list(start),
-            depth_mm=depth, target=list(entry), corrected=list(corrected),
-            correction_mm=_distance(entry, corrected))
+    corrected = (corrected_override if corrected_override is not None else
+                 _correct_entry(entry, normal, contour, spacing))
     if not _inside(corrected, contour):
         raise ValueError("{0}_entry_outside_offset_contour".format(side))
     vertices = [start]
-    if _distance(vertices[-1], entry) > TOLERANCE:
-        vertices.append(entry)
+    along = ((corrected[0] - start[0]) * normal[0] +
+             (corrected[1] - start[1]) * normal[1])
+    lateral = (corrected[0] - normal[0] * along,
+               corrected[1] - normal[1] * along)
+    _record(journal, "entry", branch=side, start=list(start),
+            depth_mm=depth, target=list(entry), lateral=list(lateral),
+            corrected=list(corrected), correction_mm=_distance(entry, corrected),
+            correction_source=("paired_alignment" if
+                               corrected_override is not None else "contour"))
+    if _distance(vertices[-1], lateral) > TOLERANCE:
+        vertices.append(lateral)
     if _distance(vertices[-1], corrected) > TOLERANCE:
         vertices.append(corrected)
     segments = [(vertices[index - 1], vertices[index])
                 for index in range(1, len(vertices))]
-    initial_turns = 0
     for index in range(1, len(segments)):
         previous = segments[index - 1]
         current = segments[index]
@@ -145,16 +269,14 @@ def _initial_branch(polygon, contour, start, normal, depth, spacing,
         cross = (previous_vector[0] * current_vector[1] -
                  previous_vector[1] * current_vector[0])
         if abs(cross) > TOLERANCE:
-            initial_turns += 1
             _record(journal, "entry_turn", branch=side,
-                    at=list(current[0]), turns_used=initial_turns)
-    if segments:
-        last = segments[-1]
-        length = _distance(last[0], last[1])
-        heading = ((last[1][0] - last[0][0]) / length,
-                   (last[1][1] - last[0][1]) / length)
-    else:
-        heading = normal
+                    at=list(current[0]), counted_in_walk=False)
+    heading = normal
+    initial_turns = 0
+    for segment in segments:
+        _record(journal, "entry_segment", branch=side,
+                start=list(segment[0]), end=list(segment[1]),
+                length_mm=_distance(*segment))
     _record(journal, "entry_heading", branch=side,
             direction=list(heading))
     return {"vertices": vertices, "segments": segments,
@@ -503,6 +625,20 @@ def _segment_clearance(first, second):
     return math.sqrt(dx * dx + dy * dy)
 
 
+def _sequential_jog_without_parallel_overlap(first, second):
+    a, b = first
+    c, d = second
+    first_horizontal = abs(a[1] - b[1]) <= TOLERANCE
+    second_horizontal = abs(c[1] - d[1]) <= TOLERANCE
+    if first_horizontal != second_horizontal:
+        return False
+    axis = 0 if first_horizontal else 1
+    first_low, first_high = sorted((a[axis], b[axis]))
+    second_low, second_high = sorted((c[axis], d[axis]))
+    return (first_high <= second_low + TOLERANCE or
+            second_high <= first_low + TOLERANCE)
+
+
 def _valid_join(right, left, bridge, contour, spacing, min_segment):
     segments = []
     for side, vertices in (("right", right), ("left", left)):
@@ -533,6 +669,10 @@ def _valid_join(right, left, bridge, contour, spacing, min_segment):
         for side_b, number_b, segment_b in segments[index + 1:]:
             adjacent = (side_a == side_b and
                         abs(number_a - number_b) == 1)
+            sequential_jog = (side_a == side_b and
+                              abs(number_a - number_b) == 2 and
+                              _sequential_jog_without_parallel_overlap(
+                                  segment_a, segment_b))
             joins = (side_a == "bridge" and side_b != "bridge" and
                      number_b == len(right if side_b == "right" else left) - 2)
             joins = joins or (side_b == "bridge" and side_a != "bridge" and
@@ -540,7 +680,7 @@ def _valid_join(right, left, bridge, contour, spacing, min_segment):
             direct_join = (bridge is None and side_a != side_b and
                            number_a == len(right if side_a == "right" else left) - 2 and
                            number_b == len(right if side_b == "right" else left) - 2)
-            if adjacent or joins or direct_join:
+            if adjacent or sequential_jog or joins or direct_join:
                 continue
             if _segment_clearance(segment_a, segment_b) < spacing - TOLERANCE:
                 return False, "pipe_clearance"
@@ -607,7 +747,8 @@ def _abandoned_segments(journal, branches, join, min_segment):
     history = []
     for event in list(journal):
         if event["action"] == "entry":
-            points = [event["start"], event["target"], event["corrected"]]
+            points = [event["start"], event.get("lateral", event["target"]),
+                      event["corrected"]]
             history.extend((event["step"], (points[index - 1], points[index]))
                            for index in (1, 2))
         elif event["action"] in ("segment", "recovery_segment"):
@@ -1240,12 +1381,16 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
     first_side = "left" if clockwise else "right"
     second_side = "right" if clockwise else "left"
     starts = {"right": right_start, "left": left_start}
+    entry_targets = _paired_entry_alignment(
+        polygon, contour, starts, normal, first_side, second_side,
+        offset_mm, spacing_mm, clockwise, journal)
     branches = {}
     for side, depth in ((first_side, offset_mm),
                         (second_side, offset_mm + spacing_mm)):
         branches[side] = _initial_branch(polygon, contour, starts[side],
                                          normal, depth, spacing_mm,
-                                         side, journal)
+                                         side, journal,
+                                         entry_targets.get(side))
     last_pair_checkpoint = None
     pair_snapshots = []
     early_recovery = None

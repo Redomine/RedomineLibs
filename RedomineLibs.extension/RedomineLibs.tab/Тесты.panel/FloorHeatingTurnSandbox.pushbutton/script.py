@@ -30,7 +30,8 @@ ENGINE_DIR = os.path.join(REPO_ROOT, "docs", "prototypes",
 if ENGINE_DIR not in sys.path:
     sys.path.insert(0, ENGINE_DIR)
 from turn_sandbox import classify_open_ends
-from vector_walk import arrowhead_segments, build_vector_route
+from vector_walk import (arrowhead_segments, build_vector_route,
+                         limit_route_length)
 from local_turn_generator import _inside
 
 
@@ -45,10 +46,14 @@ class SettingsWindow(forms.WPFWindow):
         forms.WPFWindow.__init__(self, SETTINGS_XAML)
         self.result = None
         self.config = script.get_config(SETTINGS_SECTION)
+        algorithm = getattr(self.config, "algorithm", "spiral")
+        self.serpentine_radio.IsChecked = algorithm == "serpentine"
+        self.spiral_radio.IsChecked = algorithm != "serpentine"
         clockwise = _saved_bool(getattr(self.config, "clockwise", False))
         self.clockwise_radio.IsChecked = clockwise
         self.counterclockwise_radio.IsChecked = not clockwise
         self.turns_text.Text = str(getattr(self.config, "max_turns", 100))
+        self.max_length_text.Text = str(getattr(self.config, "max_length_m", 100))
         self.offset_text.Text = str(getattr(self.config, "offset_mm", 200))
         self.spacing_text.Text = str(getattr(self.config, "spacing_mm", 150))
         self.blue_lines_check.IsChecked = _saved_bool(
@@ -63,15 +68,20 @@ class SettingsWindow(forms.WPFWindow):
                 raise ValueError("Число поворотов не может быть отрицательным")
             offset = float(self.offset_text.Text.strip().replace(",", "."))
             spacing = float(self.spacing_text.Text.strip().replace(",", "."))
+            max_length_m = float(self.max_length_text.Text.strip().replace(",", "."))
             if (math.isnan(offset) or math.isinf(offset) or
                     math.isnan(spacing) or math.isinf(spacing) or
-                    offset < 0 or spacing <= 0):
-                raise ValueError("Отступ должен быть неотрицательным, шаг — больше нуля")
+                    math.isnan(max_length_m) or math.isinf(max_length_m) or
+                    offset < 0 or spacing <= 0 or max_length_m <= 0):
+                raise ValueError("Отступ должен быть неотрицательным, шаг и длина — больше нуля")
         except (TypeError, ValueError) as error:
-            forms.alert("Проверьте предел поворотов, отступ и шаг: {0}".format(error),
-                        title="Улитка: настройки")
+            forms.alert("Проверьте повороты, длину, отступ и шаг: {0}".format(error),
+                        title="Тёплый пол: настройки")
             return
         settings = {"max_turns": max_turns,
+                    "max_length_m": max_length_m,
+                    "algorithm": ("serpentine" if self.serpentine_radio.IsChecked
+                                  else "spiral"),
                     "offset_mm": offset,
                     "spacing_mm": spacing,
                     "clockwise": bool(self.clockwise_radio.IsChecked),
@@ -226,6 +236,10 @@ def main():
     if window.result is None:
         return
     settings = window.result
+    if settings["algorithm"] == "serpentine":
+        forms.alert("Алгоритм «Змейка» пока не реализован. Выберите «Улитка».",
+                    title="Тёплый пол: построение")
+        return
     region, selection_method = _choose_region(uidoc)
     clockwise = settings["clockwise"]
     limit = settings["max_turns"]
@@ -241,6 +255,7 @@ def main():
                                spacing_mm=settings["spacing_mm"],
                                min_segment_mm=minimum_curve_mm,
                                clockwise=clockwise)
+    route = limit_route_length(route, settings["max_length_m"] * 1000.0)
     run_id = str(uuid.uuid4())
     data = {"run_id": run_id, "document_title": document.Title,
             "document_path": document.PathName, "view_id": view.Id.GetIdValue(),
@@ -275,9 +290,11 @@ def main():
     output.print_md("**Улитка: песочница**")
     print("Порядок проверки направлений: {0}".format(
         "влево, прямо, вправо" if clockwise else "вправо, прямо, влево"))
-    print("Отступ: {0:g} мм; шаг: {1:g} мм; синие линии: {2}".format(
-        settings["offset_mm"], settings["spacing_mm"],
+    print("Отступ: {0:g} мм; шаг: {1:g} мм; лимит длины: {2:g} м; синие линии: {3}".format(
+        settings["offset_mm"], settings["spacing_mm"], settings["max_length_m"],
         "включены" if settings["show_abandoned"] else "выключены"))
+    print("Суммарная длина двух труб: {0:.2f} м".format(
+        route["length_mm"] / 1000.0))
     print("Область: {0}; правая: {1}/{2} ({3}), левая: {4}/{2} ({5}) поворотов".format(
         data["region_id"], route["turns_by_branch"]["right"], limit,
         route["branches"]["right"]["stop_reason"],
@@ -304,6 +321,11 @@ def main():
                 route["rollback"]["from_round"],
                 route["rollback"]["to_round"]))
     print("Журнал: {0}".format(path if path else "сохранение выключено"))
+    if route["length_limit_hit"]:
+        forms.alert(("Следующий парный шаг превысит предел общей длины двух труб: {0:g} м. "
+                     "Построено {1:.2f} м.")
+                    .format(settings["max_length_m"], route["length_mm"] / 1000.0),
+                    title="Тёплый пол: предел длины")
 
 
 try:

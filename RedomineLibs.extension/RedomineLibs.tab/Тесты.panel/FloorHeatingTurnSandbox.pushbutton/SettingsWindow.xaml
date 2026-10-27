@@ -1,7 +1,7 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Улитка: настройки построения"
-        Width="420" Height="395" MinWidth="390" ResizeMode="NoResize"
+        Title="Тёплый пол: настройки построения"
+        Width="420" Height="485" MinWidth="390" ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen" ShowInTaskbar="False"
         Background="#FFF8FAFA" FontFamily="Segoe UI" FontSize="13">
     <Window.Resources>
@@ -23,7 +23,15 @@
         </StackPanel>
         <StackPanel>
             <TextBlock FontWeight="SemiBold" FontSize="16"
-                       Text="Параметры улитки" Margin="0,0,0,12" />
+                       Text="Параметры построения" Margin="0,0,0,12" />
+            <TextBlock Text="Алгоритм" FontWeight="SemiBold" />
+            <StackPanel Orientation="Horizontal" Margin="0,5,0,12">
+                <RadioButton x:Name="spiral_radio"
+                             GroupName="algorithm" Content="Улитка"
+                             Margin="0,0,20,0" />
+                <RadioButton x:Name="serpentine_radio"
+                             GroupName="algorithm" Content="Змейка" />
+            </StackPanel>
             <TextBlock Text="Направление построения" FontWeight="SemiBold" />
             <StackPanel Orientation="Horizontal" Margin="0,5,0,12">
                 <RadioButton x:Name="counterclockwise_radio"
@@ -39,6 +47,14 @@
                 </Grid.ColumnDefinitions>
                 <TextBlock Text="Поворотов для каждой трубы" VerticalAlignment="Center" />
                 <TextBox x:Name="turns_text" Grid.Column="1" />
+            </Grid>
+            <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="110" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Общая предельная длина, м" VerticalAlignment="Center" />
+                <TextBox x:Name="max_length_text" Grid.Column="1" />
             </Grid>
             <Grid Margin="0,0,0,12">
                 <Grid.ColumnDefinitions>
