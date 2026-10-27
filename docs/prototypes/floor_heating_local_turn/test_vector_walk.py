@@ -40,6 +40,22 @@ class VectorWalkTests(unittest.TestCase):
         self.assertFalse(complete["length_limit_hit"])
         self.assertEqual(400.0, complete["length_mm"])
 
+    def test_length_limit_does_not_leave_one_branch_a_turn_ahead(self):
+        route = {
+            "branches": {
+                "right": {"vertices": [(0, 0), (100, 0),
+                                        (100, 100), (200, 100)]},
+                "left": {"vertices": [(0, 150), (100, 150),
+                                       (200, 150), (300, 150)]}},
+            "journal": [], "turns_by_branch": {"right": 2, "left": 0},
+            "turns_used": 2, "stop_reason": {"right": None, "left": None},
+            "join": {"connected": False}, "rollback": None,
+            "abandoned_segments": []}
+        limited = limit_route_length(route, 450.0)
+        self.assertEqual({"right": 0, "left": 0},
+                         limited["turns_by_branch"])
+        self.assertEqual(300.0, limited["length_mm"])
+
     def test_clockwise_entry_near_wall_aligns_both_pipes(self):
         polygon = ((3600, 0), (0, 0), (0, 4900), (900, 4900),
                    (900, 5900), (3050, 5900), (3050, 4900),

@@ -25,6 +25,19 @@ def route_length_mm(branches):
                                         branches[side]["vertices"][1:]))
 
 
+def _visible_turn_count(vertices, entry_turns):
+    directions = []
+    for first, second in zip(vertices, vertices[1:]):
+        length = _distance(first, second)
+        if length > TOLERANCE:
+            directions.append(((second[0] - first[0]) / length,
+                               (second[1] - first[1]) / length))
+    turns = sum(1 for first, second in zip(directions, directions[1:])
+                if abs(first[0] * second[1] -
+                       first[1] * second[0]) > TOLERANCE)
+    return max(0, turns - entry_turns)
+
+
 def limit_route_length(route, max_total_length_mm):
     """Keep the longest complete paired prefix that fits the length limit."""
     if (math.isnan(max_total_length_mm) or math.isinf(max_total_length_mm) or
@@ -56,22 +69,23 @@ def limit_route_length(route, max_total_length_mm):
             kept[side].append(point)
         current_length += pair_length
     limited = copy.deepcopy(route)
+    entry_turns = {side: sum(1 for event in limited["journal"]
+                             if event["action"] == "entry_turn" and
+                             event["branch"] == side)
+                   for side in ("right", "left")}
+    while (_visible_turn_count(kept["right"], entry_turns["right"]) !=
+           _visible_turn_count(kept["left"], entry_turns["left"])):
+        side = max(("right", "left"),
+                   key=lambda name: _visible_turn_count(
+                       kept[name], entry_turns[name]))
+        if len(kept[side]) <= 1:
+            break
+        removed = kept[side].pop()
+        current_length -= _distance(kept[side][-1], removed)
     for side in ("right", "left"):
         limited["branches"][side]["vertices"] = kept[side]
         limited["branches"][side]["stop_reason"] = "length_limit"
-        directions = []
-        for first, second in zip(kept[side], kept[side][1:]):
-            length = _distance(first, second)
-            if length > TOLERANCE:
-                directions.append(((second[0] - first[0]) / length,
-                                   (second[1] - first[1]) / length))
-        turns = sum(1 for first, second in zip(directions, directions[1:])
-                    if abs(first[0] * second[1] -
-                           first[1] * second[0]) > TOLERANCE)
-        entry_turns = sum(1 for event in limited["journal"]
-                          if event["action"] == "entry_turn" and
-                          event["branch"] == side)
-        turns = max(0, turns - entry_turns)
+        turns = _visible_turn_count(kept[side], entry_turns[side])
         limited["branches"][side]["turns_used"] = turns
         limited["turns_by_branch"][side] = turns
         limited["stop_reason"][side] = "length_limit"
