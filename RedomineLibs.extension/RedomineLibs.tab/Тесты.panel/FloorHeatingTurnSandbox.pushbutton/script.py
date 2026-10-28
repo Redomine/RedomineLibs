@@ -6,7 +6,6 @@ import json
 import math
 import os
 import sys
-import traceback
 import uuid
 
 import clr
@@ -22,17 +21,17 @@ MM_PER_FOOT = 304.8
 ROOT = os.path.join(os.environ["LOCALAPPDATA"], "RvtMcp",
                     "floor-heating-turn-sandbox")
 SETTINGS_SECTION = "FloorHeatingTurnSandbox"
+ROUTE_MODES = ("spiral_clockwise", "spiral_counterclockwise",
+               "serpentine_left_to_right", "serpentine_right_to_left")
 SETTINGS_XAML = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                         "..", "..", "..", ".."))
-ENGINE_DIR = os.path.join(REPO_ROOT, "docs", "prototypes",
-                          "floor_heating_local_turn")
-if ENGINE_DIR not in sys.path:
-    sys.path.insert(0, ENGINE_DIR)
-from turn_sandbox import classify_open_ends
+COMMAND_DIR = os.path.dirname(os.path.abspath(__file__))
+if COMMAND_DIR not in sys.path:
+    sys.path.insert(0, COMMAND_DIR)
+from floor_heating_pair import classify_open_ends
 from vector_walk import (arrowhead_segments, build_vector_route,
                          limit_route_length)
-from local_turn_generator import _inside
+from serpentine_walk import build_serpentine_route
+from floor_heating_geometry import _inside
 
 
 def _saved_bool(value):
@@ -46,12 +45,15 @@ class SettingsWindow(forms.WPFWindow):
         forms.WPFWindow.__init__(self, SETTINGS_XAML)
         self.result = None
         self.config = script.get_config(SETTINGS_SECTION)
-        algorithm = getattr(self.config, "algorithm", "spiral")
-        self.serpentine_radio.IsChecked = algorithm == "serpentine"
-        self.spiral_radio.IsChecked = algorithm != "serpentine"
-        clockwise = _saved_bool(getattr(self.config, "clockwise", False))
-        self.clockwise_radio.IsChecked = clockwise
-        self.counterclockwise_radio.IsChecked = not clockwise
+        saved_mode = getattr(self.config, "route_mode", None)
+        if saved_mode not in ROUTE_MODES:
+            if getattr(self.config, "algorithm", "spiral") == "serpentine":
+                saved_mode = "serpentine_left_to_right"
+            else:
+                saved_mode = ("spiral_clockwise" if _saved_bool(
+                    getattr(self.config, "clockwise", False)) else
+                    "spiral_counterclockwise")
+        self.route_mode_combo.SelectedIndex = ROUTE_MODES.index(saved_mode)
         self.turns_text.Text = str(getattr(self.config, "max_turns", 100))
         self.max_length_text.Text = str(getattr(self.config, "max_length_m", 100))
         self.offset_text.Text = str(getattr(self.config, "offset_mm", 200))
@@ -78,13 +80,15 @@ class SettingsWindow(forms.WPFWindow):
             forms.alert("Проверьте повороты, длину, отступ и шаг: {0}".format(error),
                         title="Тёплый пол: настройки")
             return
+        mode = ROUTE_MODES[self.route_mode_combo.SelectedIndex]
         settings = {"max_turns": max_turns,
                     "max_length_m": max_length_m,
-                    "algorithm": ("serpentine" if self.serpentine_radio.IsChecked
+                    "route_mode": mode,
+                    "algorithm": ("serpentine" if mode.startswith("serpentine")
                                   else "spiral"),
                     "offset_mm": offset,
                     "spacing_mm": spacing,
-                    "clockwise": bool(self.clockwise_radio.IsChecked),
+                    "clockwise": mode == "spiral_clockwise",
                     "show_abandoned": bool(self.blue_lines_check.IsChecked),
                     "save_journal": bool(self.save_journal_check.IsChecked)}
         for key, value in settings.items():
@@ -185,7 +189,7 @@ def _draw(document, view, branches, join, abandoned_segments,
     red_override.SetProjectionLineColor(DB.Color(255, 0, 0))
     blue_override = DB.OverrideGraphicSettings()
     blue_override.SetProjectionLineColor(DB.Color(0, 0, 255))
-    transaction = DB.Transaction(document, "Улитка: диагностический фрагмент")
+    transaction = DB.Transaction(document, "Теплый пол: диагностический фрагмент")
     transaction.Start()
     try:
         if show_abandoned:
@@ -236,10 +240,6 @@ def main():
     if window.result is None:
         return
     settings = window.result
-    if settings["algorithm"] == "serpentine":
-        forms.alert("Алгоритм «Змейка» пока не реализован. Выберите «Улитка».",
-                    title="Тёплый пол: построение")
-        return
     region, selection_method = _choose_region(uidoc)
     clockwise = settings["clockwise"]
     limit = settings["max_turns"]
@@ -249,13 +249,28 @@ def main():
         raise ValueError("В области требуется ровно два свободных конца труб; найдено: {0}".format(len(ends)))
     right_end, left_end, direction, separation = classify_open_ends(ends)
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
-    route = build_vector_route(polygon, right_end["point"],
-                               left_end["point"], direction, limit,
-                               offset_mm=settings["offset_mm"],
-                               spacing_mm=settings["spacing_mm"],
-                               min_segment_mm=minimum_curve_mm,
-                               clockwise=clockwise)
+    if settings["algorithm"] == "serpentine":
+        route = build_serpentine_route(
+            polygon, right_end["point"], left_end["point"], direction, limit,
+            left_to_right=settings["route_mode"] == "serpentine_left_to_right",
+            offset_mm=settings["offset_mm"],
+            spacing_mm=settings["spacing_mm"],
+            min_segment_mm=minimum_curve_mm)
+    else:
+        route = build_vector_route(polygon, right_end["point"],
+                                   left_end["point"], direction, limit,
+                                   offset_mm=settings["offset_mm"],
+                                   spacing_mm=settings["spacing_mm"],
+                                   min_segment_mm=minimum_curve_mm,
+                                   clockwise=clockwise)
     route = limit_route_length(route, settings["max_length_m"] * 1000.0)
+    if (settings["algorithm"] == "serpentine" and
+            route["stop_reason"]["right"] == "sweep_blocked" and
+            route["turns_by_branch"]["right"] == 0):
+        forms.alert("От стартовой позиции в выбранном направлении нет места "
+                    "для первого прохода змейки.",
+                    title="Теплый пол: змейка")
+        return
     run_id = str(uuid.uuid4())
     data = {"run_id": run_id, "document_title": document.Title,
             "document_path": document.PathName, "view_id": view.Id.GetIdValue(),
@@ -265,14 +280,15 @@ def main():
                            "direction_vector": list(item["direction_vector"])}
                           for item in ends],
             "entry_direction": list(direction), "pipe_separation_mm": separation,
-            "clockwise": clockwise,
+            "clockwise": (clockwise if settings["algorithm"] == "spiral" else None),
             "settings": settings,
             "right_pipe_id": right_end["pipe_id"],
             "left_pipe_id": left_end["pipe_id"],
             "route": route, "line_ids": {"right": [], "left": [],
                                            "bridge": [], "abandoned": [],
                                            "abandoned_arrows": []}}
-    path = _write_log(data) if settings["save_journal"] else None
+    if settings["save_journal"]:
+        _write_log(data)
     data["line_ids"] = _draw(document, view, route["branches"],
                              route["join"], route["abandoned_segments"],
                              settings["spacing_mm"], minimum_curve_mm,
@@ -286,41 +302,6 @@ def main():
         event["arrow_element_ids"] = arrow_ids
     if settings["save_journal"]:
         _write_log(data)
-    output = script.get_output()
-    output.print_md("**Улитка: песочница**")
-    print("Порядок проверки направлений: {0}".format(
-        "влево, прямо, вправо" if clockwise else "вправо, прямо, влево"))
-    print("Отступ: {0:g} мм; шаг: {1:g} мм; лимит длины: {2:g} м; синие линии: {3}".format(
-        settings["offset_mm"], settings["spacing_mm"], settings["max_length_m"],
-        "включены" if settings["show_abandoned"] else "выключены"))
-    print("Суммарная длина двух труб: {0:.2f} м".format(
-        route["length_mm"] / 1000.0))
-    print("Область: {0}; правая: {1}/{2} ({3}), левая: {4}/{2} ({5}) поворотов".format(
-        data["region_id"], route["turns_by_branch"]["right"], limit,
-        route["branches"]["right"]["stop_reason"],
-        route["turns_by_branch"]["left"],
-        route["branches"]["left"]["stop_reason"]))
-    print("Правая труба: {0}; левая труба: {1}".format(
-        right_end["pipe_id"], left_end["pipe_id"]))
-    red_count = (len(data["line_ids"]["right"]) +
-                 len(data["line_ids"]["left"]) +
-                 len(data["line_ids"]["bridge"]))
-    blue_count = len(data["line_ids"]["abandoned"])
-    print("Создано линий: {0} красных, {1} синих".format(
-        red_count, blue_count))
-    print("Соединение: {0}".format(
-        route["join"].get("method", "не найдено: " + route["join"].get("reason", ""))))
-    if route["rollback"] is not None:
-        if route["rollback"]["reason"] == "paired_turn_recovery":
-            print("Парный поворот после возврата: первая {0:.0f} мм, "
-                  "вторая {1:.0f} мм от начала последних участков".format(
-                      route["rollback"]["first_checkpoint_mm"],
-                      route["rollback"]["second_checkpoint_mm"]))
-        else:
-            print("Возврат парного маршрута: шаг {0} -> шаг {1}".format(
-                route["rollback"]["from_round"],
-                route["rollback"]["to_round"]))
-    print("Журнал: {0}".format(path if path else "сохранение выключено"))
     if route["length_limit_hit"]:
         forms.alert(("Следующий парный шаг превысит предел общей длины двух труб: {0:g} м. "
                      "Построено {1:.2f} м.")
@@ -332,5 +313,4 @@ try:
     main()
 except Exception as error:
     forms.alert("Песочница не завершена: {0}".format(error),
-                title="Улитка: песочница")
-    print(traceback.format_exc())
+                title="Теплый пол: песочница")

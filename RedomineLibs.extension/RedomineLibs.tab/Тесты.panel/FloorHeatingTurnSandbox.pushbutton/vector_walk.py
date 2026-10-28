@@ -5,10 +5,10 @@ from __future__ import division
 import math
 import copy
 
-from local_turn_generator import (TOLERANCE, _advance, _correct_entry,
+from floor_heating_geometry import (TOLERANCE, _advance, _correct_entry,
                                   _distance, _inside, _offset_polygon,
                                   _ray_boundary_distance)
-from turn_sandbox import _append_branch_segment, _entry_at_depth
+from floor_heating_pair import _append_branch_segment, _entry_at_depth
 
 
 def _record(journal, action, **details):
