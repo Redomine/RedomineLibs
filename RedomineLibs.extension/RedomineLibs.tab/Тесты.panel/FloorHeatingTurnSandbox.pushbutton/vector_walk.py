@@ -83,9 +83,23 @@ def start_at_calculated_entries(route):
         vertices = route["branches"][side]["vertices"]
         index = next((i for i, point in enumerate(vertices)
                       if _distance(point, entries[side]) <= TOLERANCE), None)
-        if index is None:
-            raise ValueError("calculated_entry_not_on_route_for_" + side)
-        visible = vertices[index:]
+        starts_on_boundary = (original_starts is not None and
+                              _distance(vertices[0], original_starts[
+                                  0 if side == "right" else 1]) <= TOLERANCE and
+                              any(_on_segment(vertices[0], a, b)
+                                  for a, b in zip(polygon,
+                                                  polygon[1:] + polygon[:1])))
+        if starts_on_boundary:
+            visible = vertices
+        elif index is not None:
+            visible = vertices[index:]
+        else:
+            segment_index = next((i for i, (a, b) in enumerate(zip(
+                vertices, vertices[1:]))
+                if _on_segment(entries[side], a, b)), None)
+            if segment_index is None:
+                raise ValueError("calculated_entry_not_on_route_for_" + side)
+            visible = [entries[side]] + vertices[segment_index + 1:]
         if normal is not None and polygon is not None:
             backward = (-normal[0], -normal[1])
             distance = _ray_boundary_distance(visible[0], backward,
@@ -476,14 +490,18 @@ def _paired_next_step_available(branches, first_side, second_side,
     if first_moved and second_moved:
         join = _finish_route(copy.deepcopy(trial), contour, spacing,
                              min_segment, probe_log, first_side)
+    tight_after = (_paired_turn_room(trial, contour, spacing, offset,
+                                     probe_log, round_index + 1)
+                   if first_moved and second_moved else [])
     moves = [event for event in probe_log if event["action"] == "segment"]
     _record(journal, "pair_next_step_probe", round=round_index + 1,
             first_moved=first_moved, second_moved=second_moved,
             choices={event["branch"]: event["choice"] for event in moves},
             ends={side: list(trial[side]["vertices"][-1])
                   for side in (first_side, second_side)},
-            connected=join["connected"], reason=join.get("reason"))
-    return first_moved and second_moved and join["connected"]
+            connected=join["connected"], reason=join.get("reason"),
+            tight_after=tight_after)
+    return first_moved and second_moved and join["connected"] and not tight_after
 
 
 def _terminal_pair_without_reservation(branches, first_side, second_side,
@@ -506,14 +524,19 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
     join = {"connected": False, "reason": "incomplete_pair"}
     equal_turns = (trial[first_side]["turns_used"] ==
                    trial[second_side]["turns_used"])
-    if first_moved and second_moved and equal_turns:
+    tight_after = (_paired_turn_room(trial, contour, spacing, offset,
+                                     probe_log, round_index + 1)
+                   if first_moved and second_moved else [])
+    if first_moved and second_moved and equal_turns and not tight_after:
         join = _finish_route(trial, contour, spacing, min_segment,
                              probe_log, first_side)
-    accepted = first_moved and second_moved and equal_turns and join["connected"]
+    accepted = (first_moved and second_moved and equal_turns and
+                join["connected"] and not tight_after)
     _record(journal, "terminal_pair_probe", round=round_index + 1,
             first_moved=first_moved, second_moved=second_moved,
             equal_turns=equal_turns, connected=join["connected"],
             reason=join.get("reason"), accepted=accepted,
+            tight_after=tight_after,
             ends={side: list(trial[side]["vertices"][-1])
                   for side in (first_side, second_side)})
     if not accepted:
@@ -866,11 +889,13 @@ def _abandoned_segments(journal, branches, join, min_segment):
         if event["action"] == "entry":
             points = [event["start"], event.get("lateral", event["target"]),
                       event["corrected"]]
-            history.extend((event["step"], (points[index - 1], points[index]))
+            history.extend((event["step"], event["branch"],
+                            (points[index - 1], points[index]))
                            for index in (1, 2))
         elif event["action"] in ("segment", "recovery_segment"):
-            history.append((event["step"], (event["start"], event["end"])))
-    for source_step, segment in history:
+            history.append((event["step"], event["branch"],
+                            (event["start"], event["end"])))
+    for source_step, side, segment in history:
         start, end = segment
         if _distance(start, end) <= TOLERANCE:
             continue
@@ -901,7 +926,8 @@ def _abandoned_segments(journal, branches, join, min_segment):
         for first, second in remaining:
             if second - first <= min_segment + TOLERANCE:
                 _record(journal, "abandoned_segment_skipped",
-                        source_step=source_step, length_mm=second - first,
+                        source_step=source_step, branch=side,
+                        length_mm=second - first,
                         reason="short_curve_tolerance")
                 continue
             if axis == 0:
@@ -912,6 +938,7 @@ def _abandoned_segments(journal, branches, join, min_segment):
                 visible = (visible[1], visible[0])
             abandoned.append(visible)
             _record(journal, "abandoned_segment", source_step=source_step,
+                    branch=side,
                     start=list(visible[0]), end=list(visible[1]),
                     length_mm=second - first)
     return [[list(first), list(second)] for first, second in abandoned]

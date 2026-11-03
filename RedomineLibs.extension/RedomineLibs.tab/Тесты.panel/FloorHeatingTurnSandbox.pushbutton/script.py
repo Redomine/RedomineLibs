@@ -208,21 +208,32 @@ def _write_failure_log(run_id, region_id, settings, error):
 
 
 def _draw(document, view, branches, join, abandoned_segments,
-          spacing_mm, min_segment_mm, show_abandoned):
+          abandoned_events, first_side, spacing_mm, min_segment_mm,
+          show_abandoned):
     ids = {"right": [], "left": [], "bridge": [],
            "abandoned": [], "abandoned_arrows": []}
-    red_override = DB.OverrideGraphicSettings()
-    red_override.SetProjectionLineColor(DB.Color(255, 0, 0))
-    blue_override = DB.OverrideGraphicSettings()
-    blue_override.SetProjectionLineColor(DB.Color(0, 0, 255))
+    second_side = "left" if first_side == "right" else "right"
+    colors = {first_side: ((255, 0, 0), (0, 160, 0)),
+              second_side: ((0, 0, 255), (255, 128, 0))}
+    overrides = {}
+    for side in ("right", "left"):
+        overrides[side] = []
+        for rgb in colors[side]:
+            setting = DB.OverrideGraphicSettings()
+            setting.SetProjectionLineColor(DB.Color(*rgb))
+            overrides[side].append(setting)
+    if len(abandoned_segments) != len(abandoned_events):
+        raise ValueError("abandoned_segment_journal_mismatch")
     transaction = DB.Transaction(document, "Теплый пол: диагностический фрагмент")
     transaction.Start()
     try:
         if show_abandoned:
-            for first, second in abandoned_segments:
+            for (first, second), event in zip(abandoned_segments,
+                                              abandoned_events):
+                test_override = overrides[event["branch"]][1]
                 line = DB.Line.CreateBound(_world(first, view), _world(second, view))
                 detail = document.Create.NewDetailCurve(view, line)
-                view.SetElementOverrides(detail.Id, blue_override)
+                view.SetElementOverrides(detail.Id, test_override)
                 ids["abandoned"].append(detail.Id.GetIdValue())
                 arrow_ids = []
                 for wing_start, tip in arrowhead_segments(
@@ -230,7 +241,7 @@ def _draw(document, view, branches, join, abandoned_segments,
                     wing = DB.Line.CreateBound(_world(wing_start, view),
                                                _world(tip, view))
                     arrow = document.Create.NewDetailCurve(view, wing)
-                    view.SetElementOverrides(arrow.Id, blue_override)
+                    view.SetElementOverrides(arrow.Id, test_override)
                     arrow_ids.append(arrow.Id.GetIdValue())
                 ids["abandoned_arrows"].append(arrow_ids)
         for side in ("right", "left"):
@@ -240,13 +251,13 @@ def _draw(document, view, branches, join, abandoned_segments,
                     continue
                 line = DB.Line.CreateBound(_world(first, view), _world(second, view))
                 detail = document.Create.NewDetailCurve(view, line)
-                view.SetElementOverrides(detail.Id, red_override)
+                view.SetElementOverrides(detail.Id, overrides[side][0])
                 ids[side].append(detail.Id.GetIdValue())
         if join["connected"] and join["bridge"] is not None:
             first, second = join["bridge"]
             line = DB.Line.CreateBound(_world(first, view), _world(second, view))
             detail = document.Create.NewDetailCurve(view, line)
-            view.SetElementOverrides(detail.Id, red_override)
+            view.SetElementOverrides(detail.Id, overrides[first_side][0])
             ids["bridge"].append(detail.Id.GetIdValue())
         if transaction.Commit() != DB.TransactionStatus.Committed:
             raise RuntimeError("Транзакция построения не завершилась")
@@ -291,6 +302,10 @@ def _build_region(document, view, region, selection_method, settings, run_id):
                                    clockwise=clockwise)
     route = start_at_calculated_entries(route)
     route = limit_route_length(route, settings["max_length_m"] * 1000.0)
+    first_side = ("left" if clockwise else "right") if settings[
+        "algorithm"] == "spiral" else ("right" if settings["route_mode"].endswith(
+            "left_to_right") else "left")
+    second_side = "left" if first_side == "right" else "right"
     if (settings["algorithm"] == "serpentine" and
             route["stop_reason"]["right"] == "sweep_blocked" and
             route["turns_by_branch"]["right"] == 0):
@@ -305,6 +320,7 @@ def _build_region(document, view, region, selection_method, settings, run_id):
             "entry_direction": list(direction), "pipe_separation_mm": separation,
             "calculated_starts": {"right": list(right_start),
                                   "left": list(left_start)},
+            "pipe_roles": {"pipe_1": first_side, "pipe_2": second_side},
             "clockwise": (clockwise if settings["algorithm"] == "spiral" else None),
             "settings": settings,
             "right_pipe_id": right_end["pipe_id"],
@@ -314,14 +330,14 @@ def _build_region(document, view, region, selection_method, settings, run_id):
                                            "abandoned_arrows": []}}
     if settings["save_journal"]:
         _write_log(data)
+    test_events = [event for event in route["journal"] if
+                   event["action"] == "abandoned_segment"]
     data["line_ids"] = _draw(document, view, route["branches"],
                              route["join"], route["abandoned_segments"],
-                             settings["spacing_mm"], minimum_curve_mm,
-                             settings["show_abandoned"])
-    blue_events = [event for event in route["journal"] if
-                   event["action"] == "abandoned_segment"]
+                             test_events, first_side, settings["spacing_mm"],
+                             minimum_curve_mm, settings["show_abandoned"])
     for event, element_id, arrow_ids in zip(
-            blue_events, data["line_ids"]["abandoned"],
+            test_events, data["line_ids"]["abandoned"],
             data["line_ids"]["abandoned_arrows"]):
         event["element_id"] = element_id
         event["arrow_element_ids"] = arrow_ids

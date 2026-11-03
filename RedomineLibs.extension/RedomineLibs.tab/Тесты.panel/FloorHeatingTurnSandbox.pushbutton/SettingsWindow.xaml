@@ -66,7 +66,7 @@
                 <TextBox x:Name="spacing_text" Grid.Column="1" />
             </Grid>
             <CheckBox x:Name="blue_lines_check"
-                      Content="Показывать отброшенные линии синим" />
+                      Content="Показывать тестовые линии" />
             <CheckBox x:Name="save_journal_check" Margin="0,8,0,0"
                       Content="Сохранять журнал построения" />
             <TextBlock Margin="0,5,0,0" Foreground="#FF5A6666"
