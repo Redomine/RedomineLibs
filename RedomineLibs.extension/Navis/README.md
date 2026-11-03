@@ -1,6 +1,6 @@
 # Плагины Navisworks 2024
 
-В каталоге `RedomineLibs.extension/Navis` — два соседних независимых проекта.
+В каталоге `RedomineLibs.extension/Navis` — три соседних независимых проекта.
 Каждый собирается в одну общую папку `bin/Release/net48`, чтобы обе DLL
 лежали рядом:
 
@@ -8,6 +8,7 @@
 |-----|---------------|------------------|----------|
 | `NavisClashOrder.dll`     | `ClashOrder/`     | `Redomine.ClashOrder`       | Переставляет верхнеуровневые clash tests активного документа в порядке, заданном элементами `clashtest` файла `Clash Detective.xml`. |
 | `NavisSearchSetRename.dll` | `SearchSetRename/`| `Redomine.SearchSetRename`  | В поисковых наборах, имя которых начинается с `ВК1 В` или `ВК2 К`, заменяет во всех критериях поиска имя свойства `ФОП_ВИС_Имя системы` на `Имя системы`. Остальные настройки критерия и самих наборов сохраняются. |
+| `ToleranceChanger.dll` | `ToleranceChanger/` | `Redomine.ToleranceChanger` | Предлагает этап 1–4 и устанавливает допуски clash tests для АУПТ, ИТП, ВК1 В, ВК2 К, ОВ1 О и ОВ2 В по таблице ВИС. Прочерки и пустые ячейки берут ближайший указанный этап. |
 
 ## Запуск через AddInManager
 
@@ -15,6 +16,7 @@
 2. В AddInManager загрузите нужную DLL из `bin\Release\net48`:
    - `NavisClashOrder.dll` → `Redomine.ClashOrder`
    - `NavisSearchSetRename.dll` → `Redomine.SearchSetRename`
+   - `ToleranceChanger.dll` → `Redomine.ToleranceChanger`
 3. Запустите нужный плагин.
 
 ClashOrder сначала ищет `Clash Detective.xml` рядом с загруженной DLL. Если
@@ -29,6 +31,7 @@ AddInManager запустил DLL из временной папки и XML та
 ```powershell
 dotnet build .\ClashOrder\NavisClashOrder.csproj -c Release
 dotnet build .\SearchSetRename\NavisSearchSetRename.csproj -c Release
+dotnet build .\ToleranceChanger\ToleranceChanger.csproj -c Release
 ```
 
 Обе DLL (`NavisClashOrder.dll` и `NavisSearchSetRename.dll`) окажутся в одной
