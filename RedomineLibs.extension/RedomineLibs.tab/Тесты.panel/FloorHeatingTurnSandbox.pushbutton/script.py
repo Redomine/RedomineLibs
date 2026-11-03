@@ -14,6 +14,7 @@ import dosymep
 clr.ImportExtensions(dosymep.Revit)
 
 from Autodesk.Revit.UI.Selection import ObjectType
+from Autodesk.Revit.Exceptions import OperationCanceledException
 from pyrevit import DB, forms, script
 
 
@@ -22,15 +23,18 @@ ROOT = os.path.join(os.environ["LOCALAPPDATA"], "RvtMcp",
                     "floor-heating-turn-sandbox")
 SETTINGS_SECTION = "FloorHeatingTurnSandbox"
 ROUTE_MODES = ("spiral_clockwise", "spiral_counterclockwise",
-               "serpentine_left_to_right", "serpentine_right_to_left")
+               "serpentine_left_to_right", "serpentine_right_to_left",
+               "single_serpentine_left_to_right", "single_serpentine_right_to_left")
 SETTINGS_XAML = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
 COMMAND_DIR = os.path.dirname(os.path.abspath(__file__))
 if COMMAND_DIR not in sys.path:
     sys.path.insert(0, COMMAND_DIR)
 from floor_heating_pair import classify_open_ends
 from vector_walk import (arrowhead_segments, build_vector_route,
-                         limit_route_length)
+                         calculate_start_points, limit_route_length,
+                         start_at_calculated_entries)
 from serpentine_walk import build_serpentine_route
+from single_serpentine import build_single_serpentine_route
 from floor_heating_geometry import _inside
 
 
@@ -84,7 +88,8 @@ class SettingsWindow(forms.WPFWindow):
         settings = {"max_turns": max_turns,
                     "max_length_m": max_length_m,
                     "route_mode": mode,
-                    "algorithm": ("serpentine" if mode.startswith("serpentine")
+                    "algorithm": ("single_serpentine" if mode.startswith("single_serpentine")
+                                  else "serpentine" if mode.startswith("serpentine")
                                   else "spiral"),
                     "offset_mm": offset,
                     "spacing_mm": spacing,
@@ -112,20 +117,30 @@ def _world(point, view):
             view.UpDirection.Multiply(point[1] / MM_PER_FOOT))
 
 
-def _choose_region(uidoc):
+def _choose_regions(uidoc):
     document = uidoc.Document
     selected = [document.GetElement(identifier)
                 for identifier in uidoc.Selection.GetElementIds()]
     regions = [element for element in selected
                if isinstance(element, DB.FilledRegion)]
-    if len(regions) == 1:
-        return regions[0], "preselection"
-    reference = uidoc.Selection.PickObject(ObjectType.Element,
-                                             "Выберите одну залитую область")
-    region = document.GetElement(reference.ElementId)
-    if not isinstance(region, DB.FilledRegion):
-        raise ValueError("Выбранный элемент не является залитой областью")
-    return region, "pick"
+    if regions:
+        return regions, "preselection"
+    try:
+        references = uidoc.Selection.PickObjects(
+            ObjectType.Element, "Выберите залитые области и нажмите Готово")
+    except OperationCanceledException:
+        return [], "cancel"
+    regions = []
+    seen = set()
+    for reference in references:
+        region = document.GetElement(reference.ElementId)
+        if not isinstance(region, DB.FilledRegion):
+            continue
+        identifier = region.Id.GetIdValue()
+        if identifier not in seen:
+            regions.append(region)
+            seen.add(identifier)
+    return regions, "pick_multiple"
 
 
 def _polygon(region, view):
@@ -181,6 +196,17 @@ def _write_log(data):
     return path
 
 
+def _write_failure_log(run_id, region_id, settings, error):
+    path = os.path.join(ROOT, "run-{0}.json".format(run_id))
+    data = {"run_id": run_id, "region_id": region_id,
+            "settings": settings}
+    if os.path.isfile(path):
+        with io.open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    data["error"] = unicode(error)
+    _write_log(data)
+
+
 def _draw(document, view, branches, join, abandoned_segments,
           spacing_mm, min_segment_mm, show_abandoned):
     ids = {"right": [], "left": [], "bridge": [],
@@ -231,16 +257,7 @@ def _draw(document, view, branches, join, abandoned_segments,
     return ids
 
 
-def main():
-    uidoc = __revit__.ActiveUIDocument
-    document = uidoc.Document
-    view = uidoc.ActiveView
-    window = SettingsWindow()
-    window.ShowDialog()
-    if window.result is None:
-        return
-    settings = window.result
-    region, selection_method = _choose_region(uidoc)
+def _build_region(document, view, region, selection_method, settings, run_id):
     clockwise = settings["clockwise"]
     limit = settings["max_turns"]
     polygon = _polygon(region, view)
@@ -248,30 +265,36 @@ def main():
     if len(ends) != 2:
         raise ValueError("В области требуется ровно два свободных конца труб; найдено: {0}".format(len(ends)))
     right_end, left_end, direction, separation = classify_open_ends(ends)
+    right_start, left_start = calculate_start_points(
+        polygon, right_end["point"], left_end["point"], direction,
+        settings["offset_mm"], settings["spacing_mm"])
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
-    if settings["algorithm"] == "serpentine":
+    if settings["algorithm"] == "single_serpentine":
+        route = build_single_serpentine_route(
+            polygon, right_start, left_start, direction, limit,
+            left_to_right=settings["route_mode"] == "single_serpentine_left_to_right",
+            offset_mm=settings["offset_mm"], spacing_mm=settings["spacing_mm"],
+            min_segment_mm=minimum_curve_mm)
+    elif settings["algorithm"] == "serpentine":
         route = build_serpentine_route(
-            polygon, right_end["point"], left_end["point"], direction, limit,
+            polygon, right_start, left_start, direction, limit,
             left_to_right=settings["route_mode"] == "serpentine_left_to_right",
             offset_mm=settings["offset_mm"],
             spacing_mm=settings["spacing_mm"],
             min_segment_mm=minimum_curve_mm)
     else:
-        route = build_vector_route(polygon, right_end["point"],
-                                   left_end["point"], direction, limit,
+        route = build_vector_route(polygon, right_start,
+                                   left_start, direction, limit,
                                    offset_mm=settings["offset_mm"],
                                    spacing_mm=settings["spacing_mm"],
                                    min_segment_mm=minimum_curve_mm,
                                    clockwise=clockwise)
+    route = start_at_calculated_entries(route)
     route = limit_route_length(route, settings["max_length_m"] * 1000.0)
     if (settings["algorithm"] == "serpentine" and
             route["stop_reason"]["right"] == "sweep_blocked" and
             route["turns_by_branch"]["right"] == 0):
-        forms.alert("От стартовой позиции в выбранном направлении нет места "
-                    "для первого прохода змейки.",
-                    title="Теплый пол: змейка")
-        return
-    run_id = str(uuid.uuid4())
+        raise ValueError(u"От стартовой позиции нет места для первого прохода змейки")
     data = {"run_id": run_id, "document_title": document.Title,
             "document_path": document.PathName, "view_id": view.Id.GetIdValue(),
             "view_name": view.Name, "region_id": region.Id.GetIdValue(),
@@ -280,6 +303,8 @@ def main():
                            "direction_vector": list(item["direction_vector"])}
                           for item in ends],
             "entry_direction": list(direction), "pipe_separation_mm": separation,
+            "calculated_starts": {"right": list(right_start),
+                                  "left": list(left_start)},
             "clockwise": (clockwise if settings["algorithm"] == "spiral" else None),
             "settings": settings,
             "right_pipe_id": right_end["pipe_id"],
@@ -302,11 +327,46 @@ def main():
         event["arrow_element_ids"] = arrow_ids
     if settings["save_journal"]:
         _write_log(data)
-    if route["length_limit_hit"]:
-        forms.alert(("Следующий парный шаг превысит предел общей длины двух труб: {0:g} м. "
-                     "Построено {1:.2f} м.")
-                    .format(settings["max_length_m"], route["length_mm"] / 1000.0),
-                    title="Тёплый пол: предел длины")
+    return data
+
+
+def main():
+    uidoc = __revit__.ActiveUIDocument
+    document = uidoc.Document
+    view = uidoc.ActiveView
+    window = SettingsWindow()
+    window.ShowDialog()
+    if window.result is None:
+        return
+    settings = window.result
+    regions, selection_method = _choose_regions(uidoc)
+    if not regions:
+        return
+    successes = []
+    failures = []
+    limited = []
+    for region in regions:
+        identifier = region.Id.GetIdValue()
+        run_id = str(uuid.uuid4())
+        try:
+            data = _build_region(document, view, region, selection_method,
+                                 settings, run_id)
+            successes.append(identifier)
+            if data["route"]["length_limit_hit"]:
+                limited.append(identifier)
+        except Exception as error:
+            failures.append((identifier, unicode(error)))
+            if settings["save_journal"]:
+                _write_failure_log(run_id, identifier, settings, error)
+    if len(regions) > 1 or failures or limited:
+        lines = [u"Областей: {0}; построено: {1}; ошибок: {2}.".format(
+            len(regions), len(successes), len(failures))]
+        if limited:
+            lines.append(u"Предел длины достигнут: {0}.".format(
+                u", ".join(str(value) for value in limited)))
+        for identifier, error in failures:
+            lines.append(u"Область {0}: {1}".format(identifier, error))
+        forms.alert(u"\n".join(lines), title=u"Тёплый пол: массовый тест")
 
 
 try:

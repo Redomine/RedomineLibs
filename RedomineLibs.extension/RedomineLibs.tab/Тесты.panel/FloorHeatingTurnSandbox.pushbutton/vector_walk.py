@@ -6,7 +6,7 @@ import math
 import copy
 
 from floor_heating_geometry import (TOLERANCE, _advance, _correct_entry,
-                                  _distance, _inside, _offset_polygon,
+                                  _distance, _inside, _on_segment, _offset_polygon,
                                   _ray_boundary_distance)
 from floor_heating_pair import _append_branch_segment, _entry_at_depth
 
@@ -23,6 +23,107 @@ def route_length_mm(branches):
                for side in ("right", "left")
                for first, second in zip(branches[side]["vertices"],
                                         branches[side]["vertices"][1:]))
+
+
+def calculate_start_points(polygon, right_start, left_start, normal,
+                           offset, spacing):
+    """Project the inlet midpoint onto the boundary and clamp the pair."""
+    right = (normal[1], -normal[0])
+    backward = (-normal[0], -normal[1])
+    middle = ((right_start[0] + left_start[0]) / 2.0,
+              (right_start[1] + left_start[1]) / 2.0)
+    depth = _ray_boundary_distance(middle, backward, polygon)
+    on_boundary = any(_on_segment(middle, first, second)
+                      for first, second in zip(polygon, polygon[1:] + polygon[:1]))
+    if depth <= TOLERANCE and not on_boundary:
+        raise ValueError(u"Не найдена граница области под серединой труб")
+    center = _advance(middle, backward, depth)
+    left_room = _ray_boundary_distance(center, (-right[0], -right[1]), polygon)
+    right_room = _ray_boundary_distance(center, right, polygon)
+    required = offset + spacing / 2.0
+    if left_room + right_room < 2.0 * required - TOLERANCE:
+        raise ValueError(u"На границе нет места для двух стартов")
+    shift = max(required - left_room, 0.0)
+    if right_room - shift < required - TOLERANCE:
+        shift = -(required - right_room)
+    center = _advance(center, right, shift)
+    return (_advance(center, right, spacing / 2.0),
+            _advance(center, right, -spacing / 2.0))
+
+
+def start_at_calculated_entries(route):
+    """Remove construction leads; keep the calculated route from each entry."""
+    entries = {}
+    normal = None
+    first_side = None
+    spacing = None
+    polygon = None
+    original_starts = None
+    offset = None
+    for event in route["journal"]:
+        if event["action"] in ("input", "serpentine_input",
+                               "single_serpentine_input"):
+            normal = event["entry_direction"]
+            spacing = event["spacing_mm"]
+            polygon = event["polygon"]
+            offset = event["offset_mm"]
+            original_starts = (event["right_start"], event["left_start"])
+            first_side = ("left" if event.get("clockwise", False) else "right")
+            if "left_to_right" in event:
+                first_side = ("right" if event["left_to_right"] else "left")
+        if event["action"] == "entry":
+            entries[event["branch"]] = event["corrected"]
+        elif event["action"] == "single_serpentine_join":
+            first_side = event["first_branch"]
+            entries[event["first_branch"]] = event["first_entry"]
+            entries[event["second_branch"]] = event["second_entry"]
+    for side in ("right", "left"):
+        if side not in entries:
+            raise ValueError("calculated_entry_missing_for_" + side)
+        vertices = route["branches"][side]["vertices"]
+        index = next((i for i, point in enumerate(vertices)
+                      if _distance(point, entries[side]) <= TOLERANCE), None)
+        if index is None:
+            raise ValueError("calculated_entry_not_on_route_for_" + side)
+        visible = vertices[index:]
+        if normal is not None and polygon is not None:
+            backward = (-normal[0], -normal[1])
+            distance = _ray_boundary_distance(visible[0], backward,
+                                               polygon)
+            if distance > TOLERANCE:
+                visible = [_advance(visible[0], backward, distance)] + visible
+        route["branches"][side]["vertices"] = visible
+    if normal is not None and original_starts is not None:
+        right = (normal[1], -normal[0])
+        target_right, target_left = calculate_start_points(
+            polygon, original_starts[0], original_starts[1], normal,
+            offset, spacing)
+        targets = {"right": target_right, "left": target_left}
+        for side in ("right", "left"):
+            vertices = route["branches"][side]["vertices"]
+            target = targets[side]
+            if not _inside(target, polygon):
+                raise ValueError(u"Расчётный старт вне области")
+            delta = ((target[0] - vertices[0][0]) * right[0] +
+                     (target[1] - vertices[0][1]) * right[1])
+            vertices[0] = target
+            if len(vertices) > 1 and abs((vertices[1][0] - target[0]) * normal[0] +
+                                         (vertices[1][1] - target[1]) * normal[1]) > TOLERANCE:
+                vertices[1] = _advance(vertices[1], right, delta)
+    route["journal"] = [event for event in route["journal"]
+                        if event["action"] not in
+                        ("entry_segment", "entry_turn", "entry_heading")]
+    if route["join"].get("connected") and spacing is not None:
+        valid, reason = _valid_join(
+            route["branches"]["right"]["vertices"],
+            route["branches"]["left"]["vertices"],
+            route["join"].get("bridge"), route["contour"], spacing, 0.0)
+        if not valid:
+            raise ValueError(u"Стартовые позиции нарушают геометрию: " + reason)
+    _record(route["journal"], "start_at_calculated_entries",
+            right=list(route["branches"]["right"]["vertices"][0]),
+            left=list(route["branches"]["left"]["vertices"][0]))
+    return route
 
 
 def _visible_turn_count(vertices, entry_turns):
@@ -466,7 +567,7 @@ def _intermediate_checkpoints(point, direction, travel, spacing,
             position = a[axis] + sign * spacing
             distance = (position - point[axis]) * direction[axis]
             if (distance + TOLERANCE >= spacing and
-                    distance + min_segment < travel - TOLERANCE):
+                    distance < travel - TOLERANCE):
                 candidates.append((distance, "pipe_offset",
                                    obstacle["kind"]))
     checkpoint = spacing
@@ -566,7 +667,9 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                 run_ready = checkpoint + TOLERANCE >= minimum_turn_run
                 if available and future_turn_allowed and run_ready:
                     if turn_name == secondary_name:
-                        last_turn = (checkpoint, turn_name)
+                        if (last_turn is None or
+                                checkpoint > last_turn[0] + TOLERANCE):
+                            last_turn = (checkpoint, turn_name)
                         _record(journal, "backtrack_candidate", branch=side,
                                 round=round_index, distance_mm=checkpoint,
                                 next_direction=turn_name)
