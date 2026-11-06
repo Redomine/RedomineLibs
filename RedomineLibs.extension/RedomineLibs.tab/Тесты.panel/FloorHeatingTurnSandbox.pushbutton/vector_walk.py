@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Diagnostic paired walk: check right, forward, then left at each endpoint."""
+"""Diagnostic paired walk with heading and contour-guided turn policies."""
 from __future__ import division
 
 import math
@@ -232,6 +232,176 @@ def _directions(heading, clockwise=False):
     return (primary, ("forward", heading), secondary)
 
 
+def _contour_projection(point, contour, clockwise, previous=None,
+                        corner_reach=0.0, force_next=False):
+    """Move the normal foot along its edge and across the next corner."""
+    area = sum(a[0] * b[1] - b[0] * a[1]
+               for a, b in zip(contour, contour[1:] + contour[:1]))
+    ordered = (contour if (area < 0) == clockwise else
+               list(reversed(contour)))
+    lengths = [_distance(a, b) for a, b in
+               zip(ordered, ordered[1:] + ordered[:1])]
+    perimeter = sum(lengths)
+    def on_edge(index):
+        length = lengths[index]
+        start = ordered[index]
+        end = ordered[(index + 1) % len(ordered)]
+        direction = ((end[0] - start[0]) / length,
+                     (end[1] - start[1]) / length)
+        along = max(0.0, min(length,
+                    (point[0] - start[0]) * direction[0] +
+                    (point[1] - start[1]) * direction[1]))
+        foot = _advance(start, direction, along)
+        return along, foot, _distance(point, foot)
+    if perimeter <= TOLERANCE:
+        return None
+    if previous is None or "edge" not in previous:
+        options = []
+        for index, length in enumerate(lengths):
+            if length <= TOLERANCE:
+                continue
+            along, foot, distance = on_edge(index)
+            phase = sum(lengths[:index]) + along
+            options.append((distance, phase, index, along, foot))
+        if not options:
+            return None
+        distance, phase, index, along, foot = min(options)
+        return {"phase": phase, "foot": foot, "distance": distance,
+                "edge": index, "along": along, "backward": False}
+    index = previous["edge"]
+    along, foot, distance = on_edge(index)
+    if force_next:
+        next_index = (index + 1) % len(ordered)
+        if lengths[next_index] > TOLERANCE:
+            next_along, next_foot, next_distance = on_edge(next_index)
+            return {"phase": previous["phase"] +
+                    lengths[index] - previous["along"] + next_along,
+                    "foot": next_foot, "distance": next_distance,
+                    "edge": next_index, "along": next_along,
+                    "backward": False}
+    backwards = along < previous["along"] - TOLERANCE
+    phase = previous["phase"] + max(0.0, along - previous["along"])
+    result = {"phase": phase, "foot": foot, "distance": distance,
+              "edge": index, "along": along, "backward": backwards}
+    if (not backwards and
+            along + corner_reach >= lengths[index] - TOLERANCE):
+        next_index = (index + 1) % len(ordered)
+        if lengths[next_index] > TOLERANCE:
+            next_along, next_foot, next_distance = on_edge(next_index)
+            if next_distance < distance - TOLERANCE:
+                result = {"phase": phase + lengths[index] - along + next_along,
+                          "foot": next_foot, "distance": next_distance,
+                          "edge": next_index, "along": next_along,
+                          "backward": False}
+    return result
+
+
+def _contour_heading_support(point, direction, contour, clockwise, previous):
+    """Find a directed supporting side for an inner pass, without phase credit."""
+    area = sum(a[0] * b[1] - b[0] * a[1]
+               for a, b in zip(contour, contour[1:] + contour[:1]))
+    ordered = contour if (area < 0) == clockwise else list(reversed(contour))
+    options = []
+    for index, a in enumerate(ordered):
+        b = ordered[(index + 1) % len(ordered)]
+        length = _distance(a, b)
+        if length <= TOLERANCE:
+            continue
+        tangent = ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
+        if any(abs(tangent[i] - direction[i]) > TOLERANCE for i in (0, 1)):
+            continue
+        along = sum((point[i] - a[i]) * tangent[i] for i in (0, 1))
+        if along < -TOLERANCE or along > length + TOLERANCE:
+            continue
+        along = max(0.0, min(length, along))
+        foot = _advance(a, tangent, along)
+        distance = _distance(point, foot)
+        # Only support on the interior side of the oriented boundary.
+        cross = tangent[0] * (point[1] - foot[1]) - tangent[1] * (point[0] - foot[0])
+        if (cross > TOLERANCE if clockwise else cross < -TOLERANCE):
+            continue
+        if distance > TOLERANCE:
+            normal = ((foot[0] - point[0]) / distance,
+                      (foot[1] - point[1]) / distance)
+            if _ray_boundary_distance(point, normal, contour) < distance - TOLERANCE:
+                continue
+        options.append((distance, index, along, foot))
+    if not options:
+        return None
+    distance, index, along, foot = min(options)
+    return {"edge": index, "along": along, "foot": foot,
+            "distance": distance, "phase": previous["phase"],
+            "backward": False}
+
+
+def _contour_tangent(anchor, contour, clockwise, edge_offset=0):
+    area = sum(a[0] * b[1] - b[0] * a[1]
+               for a, b in zip(contour, contour[1:] + contour[:1]))
+    ordered = (contour if (area < 0) == clockwise else
+               list(reversed(contour)))
+    index = (anchor["edge"] + edge_offset) % len(ordered)
+    start = ordered[index]
+    end = ordered[(index + 1) % len(ordered)]
+    length = _distance(start, end)
+    if length <= TOLERANCE:
+        return None
+    return ((end[0] - start[0]) / length,
+            (end[1] - start[1]) / length)
+
+
+def _next_contour_tangent(anchor, contour, clockwise):
+    return _contour_tangent(anchor, contour, clockwise, 1)
+
+
+def _contour_directions(branch, contour, clockwise, spacing):
+    if not branch.get("contour_guided", False):
+        return list(_directions(branch["heading"], clockwise))
+    point = branch["vertices"][-1]
+    anchor = branch.get("contour_anchor")
+    if anchor is None:
+        anchor = _contour_projection(point, contour, clockwise)
+    if anchor is None:
+        return list(_directions(branch["heading"], clockwise))
+    next_tangent = _next_contour_tangent(anchor, contour, clockwise)
+    next_anchor = _contour_projection(
+        point, contour, clockwise, anchor, force_next=True)
+    at_corner = (next_anchor["phase"] <= anchor["phase"] + TOLERANCE and
+                 anchor["distance"] <= 2.0 * spacing + TOLERANCE)
+    ranked = []
+    deferred = []
+    for index, (name, direction) in enumerate(
+            _directions(branch["heading"], clockwise)):
+        target = _advance(point, direction, spacing)
+        projection = _contour_projection(target, contour, clockwise,
+                                         anchor, spacing)
+        if projection["backward"]:
+            next_projection = _contour_projection(
+                target, contour, clockwise, anchor, spacing,
+                force_next=True)
+            if (next_projection["phase"] + TOLERANCE >= anchor["phase"] and
+                    next_projection["distance"] <=
+                    anchor["distance"] + spacing + TOLERANCE):
+                deferred.append((name, direction))
+            continue
+        progress = projection["phase"] - anchor["phase"]
+        corner_turn = (at_corner and next_tangent is not None and
+                       direction == next_tangent)
+        ranked.append((0 if corner_turn else 1 if progress > TOLERANCE else 2,
+                       -progress, index, name, direction))
+    ranked.sort()
+    directions = [(item[-2], item[-1]) for item in ranked]
+    directions.extend(deferred)
+    candidates = branch.get("contour_candidates")
+    if candidates is not None:
+        alternate = dict(branch)
+        alternate["contour_anchor"] = candidates["reserve"]
+        alternate["contour_candidates"] = None
+        for item in _contour_directions(alternate, contour, clockwise, spacing):
+            if item[0] not in [name for name, vector in directions]:
+                directions.append(item)
+    return directions
+
+
 def _same_obstacle_segment(first, second):
     if first is None or second is None:
         return False
@@ -411,7 +581,9 @@ def _initial_branch(polygon, contour, start, normal, depth, spacing,
     return {"vertices": vertices, "segments": segments,
             "heading": heading, "turns_used": initial_turns,
             "stop_reason": None, "pending_turn": None,
-            "last_blocker": None, "returning_from_protrusion": None}
+            "contour_candidates": None,
+            "last_blocker": None, "last_blocker_segment": None,
+            "returning_from_protrusion": None}
 
 
 def _obstacles(branch, kind):
@@ -553,7 +725,10 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
 def _next_reservation(branch, contour, other_obstacles, spacing, offset,
                       min_segment, max_turns, journal, side, clockwise=False):
     point = branch["vertices"][-1]
-    candidates = _directions(branch["heading"], clockwise)
+    candidates = _contour_directions(branch, contour, clockwise, spacing)
+    pending = branch.get("pending_turn")
+    if pending is not None:
+        candidates.sort(key=lambda item: 0 if item[0] == pending else 1)
     for name, direction in candidates:
         result = probe_ray(point, direction, contour, branch["segments"],
                            other_obstacles, spacing)
@@ -606,6 +781,39 @@ def _intermediate_checkpoints(point, direction, travel, spacing,
     return unique
 
 
+def _turn_preserves_partner_exit(trial_segments, sample, turn_direction,
+                                 other_obstacles, contour, spacing, offset,
+                                 min_segment):
+    """Reject a speculative reservation that closes all existing partner exits."""
+    other_segments = [item["segment"] for item in other_obstacles
+                      if item["kind"] == "other_branch"]
+    if not other_segments:
+        return True
+    a, point = other_segments[-1]
+    length = _distance(a, point)
+    if length <= TOLERANCE:
+        return True
+    heading = ((point[0]-a[0])/length, (point[1]-a[1])/length)
+    obstacles = [{"segment": segment, "kind": "other_branch"}
+                 for segment in trial_segments]
+    reservation = {"segment": (sample, _advance(sample, turn_direction, spacing)),
+                   "kind": "first_turn_reservation"}
+    had_exit = False
+    for name, direction in _directions(heading):
+        before = probe_ray(point, direction, contour, other_segments,
+                           obstacles, spacing)
+        required = offset if before["blocker"] == "boundary" else spacing
+        if not _can_travel(before["available_mm"], required, min_segment):
+            continue
+        had_exit = True
+        after = probe_ray(point, direction, contour, other_segments,
+                          obstacles + [reservation], spacing)
+        required = offset if after["blocker"] == "boundary" else spacing
+        if _can_travel(after["available_mm"], required, min_segment):
+            return True
+    return not had_exit
+
+
 def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
               min_segment, max_turns, journal, round_index,
               clockwise=False, minimum_turn_run=0.0):
@@ -617,13 +825,28 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                 reason="turn_limit", turns_used=branch["turns_used"])
         return False
     point = branch["vertices"][-1]
-    directions = list(_directions(branch["heading"], clockwise))
+    directions = _contour_directions(branch, contour, clockwise, spacing)
+    anchor = branch.get("contour_anchor")
+    contour_tangent = (_contour_tangent(anchor, contour, clockwise)
+                       if branch.get("contour_guided", False) and
+                       anchor is not None else None)
+    blocked_tangent = False
+    _record(journal, "contour_direction_order", branch=side,
+            round=round_index, at=list(point),
+            order=[name for name, direction in directions],
+            anchor=branch.get("contour_anchor"),
+            reserve=(branch["contour_candidates"]["reserve"] if
+                     branch.get("contour_candidates") is not None else None))
     pending_turn = branch.get("pending_turn")
     if pending_turn is not None:
         directions.sort(key=lambda item: 0 if item[0] == pending_turn else 1)
         _record(journal, "backtrack_turn_priority", branch=side,
                 round=round_index, candidate=pending_turn)
         branch["pending_turn"] = None
+    if branch.get("recovery_only_direction") is not None:
+        directions = [item for item in directions if
+                      item[0] == branch["recovery_only_direction"]]
+        branch["recovery_only_direction"] = None
     for name, direction in directions:
         result = probe_ray(point, direction, contour, branch["segments"],
                            other_obstacles, spacing)
@@ -631,7 +854,7 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                 round=round_index, candidate=name, at=list(point),
                 result=result)
         avoided = branch.get("rejected_primary_obstacle")
-        primary_name = _directions(branch["heading"], clockwise)[0][0]
+        primary_name = directions[0][0] if directions else None
         if name == primary_name and avoided is not None:
             if _same_obstacle_segment(result.get("blocker_segment"), avoided):
                 _record(journal, "rejected_dead_end_opening", branch=side,
@@ -641,14 +864,19 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
             branch["rejected_primary_obstacle"] = None
         required = offset if result["blocker"] == "boundary" else spacing
         if not _can_travel(result["available_mm"], required, min_segment):
+            if (contour_tangent is not None and
+                    abs(direction[0] - contour_tangent[0]) <= TOLERANCE and
+                    abs(direction[1] - contour_tangent[1]) <= TOLERANCE and
+                    result["blocker"] in
+                    ("other_branch", "same_branch",
+                     "first_turn_reservation")):
+                blocked_tangent = True
             _record(journal, "direction_rejected", branch=side,
                     candidate=name, reason="dictating_distance_at_origin",
                     available_mm=result["available_mm"],
                     required_mm=max(min_segment, required))
             continue
         travel = result["available_mm"]
-        primary_name, primary_direction = _directions(direction, clockwise)[0]
-        secondary_name, secondary_direction = _directions(direction, clockwise)[2]
         last_turn = None
         preferred_selected = False
         checkpoints = _intermediate_checkpoints(
@@ -659,9 +887,36 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
             trial_segments = branch["segments"] + [(point, sample)]
             future_turn_allowed = (branch["turns_used"] +
                                    (0 if name == "forward" else 1) < max_turns)
-            directions = [(primary_name, primary_direction),
-                          (secondary_name, secondary_direction)]
-            for turn_name, turn_direction in directions:
+            sample_branch = dict(branch)
+            sample_branch["heading"] = direction
+            sample_branch["vertices"] = branch["vertices"][:-1] + [sample]
+            sample_branch["contour_anchor"] = _contour_projection(
+                sample, contour, clockwise,
+                branch.get("contour_anchor") or
+                _contour_projection(point, contour, clockwise), spacing)
+            straight_progress = None
+            if branch.get("contour_guided", False):
+                straight_probe = probe_ray(
+                    sample, direction, contour, trial_segments,
+                    other_obstacles, spacing)
+                if straight_probe["available_mm"] > min_segment + TOLERANCE:
+                    straight_target = _advance(
+                        sample, direction,
+                        min(spacing, straight_probe["available_mm"]))
+                    straight_anchor = _contour_projection(
+                        straight_target, contour, clockwise,
+                        sample_branch["contour_anchor"], spacing)
+                    if not straight_anchor["backward"]:
+                        straight_progress = (
+                            straight_anchor["phase"] -
+                            sample_branch["contour_anchor"]["phase"])
+            side_directions = [item for item in _contour_directions(
+                sample_branch, contour, clockwise, spacing)
+                if item[0] != "forward"]
+            primary_name = side_directions[0][0] if side_directions else None
+            secondary_name = (side_directions[1][0]
+                              if len(side_directions) > 1 else None)
+            for turn_name, turn_direction in side_directions:
                 side_probe = probe_ray(sample, turn_direction, contour,
                                       trial_segments, other_obstacles,
                                       spacing)
@@ -680,16 +935,90 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                                  else spacing)
                 available = _can_travel(side_probe["available_mm"],
                                         side_required, min_segment)
+                side_progress = None
+                contour_decision = None
+                if available and branch.get("contour_guided", False):
+                    side_target = _advance(
+                        sample, turn_direction,
+                        min(spacing, side_probe["available_mm"]))
+                    side_anchor = _contour_projection(
+                        side_target, contour, clockwise,
+                        sample_branch["contour_anchor"], spacing)
+                    side_progress = (side_anchor["phase"] -
+                                     sample_branch["contour_anchor"]["phase"])
+                    sample_tangent = _contour_tangent(
+                        sample_branch["contour_anchor"], contour, clockwise)
+                    next_tangent = _next_contour_tangent(
+                        sample_branch["contour_anchor"], contour, clockwise)
+                    following_contour = any(
+                        tangent is not None and
+                        abs(direction[0] - tangent[0]) <= TOLERANCE and
+                        abs(direction[1] - tangent[1]) <= TOLERANCE
+                        for tangent in (sample_tangent, next_tangent))
+                    sample_next = _next_contour_tangent(
+                        sample_branch["contour_anchor"], contour,
+                        clockwise)
+                    sample_next_anchor = _contour_projection(
+                        sample, contour, clockwise,
+                        sample_branch["contour_anchor"],
+                        force_next=True)
+                    corner_turn = (
+                        sample_next is not None and
+                        turn_direction == sample_next and
+                        sample_branch["contour_anchor"]["distance"] <=
+                        2.0 * spacing + TOLERANCE and
+                        sample_next_anchor["phase"] <=
+                        sample_branch["contour_anchor"]["phase"] +
+                        TOLERANCE)
+                    obstacle_return = (
+                        name != "forward" and
+                        turn_direction == branch["heading"] and
+                        branch.get("last_blocker") in
+                        ("other_branch", "same_branch", "first_turn_reservation"))
+                    if obstacle_return:
+                        contour_decision = "obstacle_return"
+                    elif side_anchor["backward"]:
+                        contour_decision = "backward"
+                        available = False
+                    elif corner_turn:
+                        contour_decision = "corner_turn"
+                    elif following_contour and straight_progress is not None:
+                        contour_decision = "continue_contour"
+                        available = False
+                    elif (straight_progress is not None and
+                          side_progress <= straight_progress + TOLERANCE):
+                        contour_decision = "straight_progress"
+                        available = False
+                    else:
+                        # Phase gain is a preference, not a geometric reason
+                        # to interrupt a clear pass. Keep this turn only as
+                        # an escape if the full endpoint has no continuation.
+                        contour_decision = "phase_fallback"
+                if (available and branch.get("contour_guided", False) and
+                        not _turn_preserves_partner_exit(
+                            trial_segments, sample, turn_direction,
+                            other_obstacles, contour, spacing, offset,
+                            min_segment)):
+                    available = False
+                    contour_decision = "partner_exit_blocked"
+                    _record(journal, "intermediate_turn_pair_rejected",
+                            branch=side, round=round_index, at=list(sample),
+                            candidate=turn_name, reason=contour_decision)
                 _record(journal, "intermediate_turn_probe", branch=side,
                         round=round_index, distance_mm=checkpoint,
                         at=list(sample), candidate=turn_name,
                         checkpoint_source=checkpoint_source,
                         checkpoint_obstacle_kind=checkpoint_kind,
                         result=side_probe, turn_available=available,
+                        contour_decision=contour_decision,
+                        contour_progress_mm=side_progress,
+                        straight_progress_mm=straight_progress,
                         within_turn_limit=future_turn_allowed)
                 run_ready = checkpoint + TOLERANCE >= minimum_turn_run
                 if available and future_turn_allowed and run_ready:
-                    if turn_name == secondary_name:
+                    if (contour_decision == "phase_fallback" or
+                            (turn_name == secondary_name and
+                             contour_decision != "obstacle_return")):
                         if (last_turn is None or
                                 checkpoint > last_turn[0] + TOLERANCE):
                             last_turn = (checkpoint, turn_name)
@@ -699,6 +1028,8 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                     else:
                         travel = checkpoint
                         preferred_selected = True
+                        if contour_decision == "obstacle_return":
+                            branch["pending_turn"] = turn_name
                         _record(journal, "intermediate_turn_selected",
                                 branch=side, round=round_index,
                                 distance_mm=checkpoint,
@@ -711,7 +1042,15 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
         if not preferred_selected and last_turn is not None:
             endpoint = _advance(point, direction, result["available_mm"])
             trial_segments = branch["segments"] + [(point, endpoint)]
-            for exit_name, exit_direction in _directions(direction, clockwise):
+            endpoint_branch = dict(branch)
+            endpoint_branch["heading"] = direction
+            endpoint_branch["vertices"] = branch["vertices"][:-1] + [endpoint]
+            endpoint_branch["contour_anchor"] = _contour_projection(
+                endpoint, contour, clockwise,
+                branch.get("contour_anchor") or
+                _contour_projection(point, contour, clockwise), spacing)
+            for exit_name, exit_direction in _contour_directions(
+                    endpoint_branch, contour, clockwise, spacing):
                 exit_probe = probe_ray(endpoint, exit_direction, contour,
                                        trial_segments, other_obstacles, spacing)
                 exit_required = (offset if exit_probe["blocker"] == "boundary"
@@ -731,11 +1070,123 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
                     round=round_index, from_distance_mm=result["available_mm"],
                     to_distance_mm=travel, next_direction=last_turn[1])
         target = _advance(point, direction, travel)
+        active_candidates = branch.get("contour_candidates")
+        current_anchor = (branch.get("contour_anchor") or
+                          _contour_projection(point, contour, clockwise))
+        current_target = _contour_projection(
+            target, contour, clockwise, current_anchor, spacing)
+        if (branch.get("contour_guided", False) and
+                current_target["backward"] and
+                active_candidates is None):
+            next_edge_target = _contour_projection(
+                target, contour, clockwise, current_anchor, spacing,
+                force_next=True)
+            if (next_edge_target["phase"] + TOLERANCE >=
+                    current_anchor["phase"] and
+                    next_edge_target["distance"] <=
+                    current_anchor["distance"] + spacing + TOLERANCE):
+                current_target = next_edge_target
+                _record(journal, "contour_next_edge_candidate",
+                        branch=side, round=round_index,
+                        candidate=name, at=list(target),
+                        edge=next_edge_target["edge"])
+            else:
+                # An inner pass can outlive a short side of the original
+                # contour. Rebind its support, never shorten free geometry
+                # solely to keep that obsolete projection monotone.
+                replacement = _contour_heading_support(
+                    target, direction, contour, clockwise, current_anchor)
+                if replacement is not None:
+                    current_target = replacement
+                    _record(journal, "contour_support_rebound",
+                            branch=side, round=round_index,
+                            from_edge=current_anchor["edge"],
+                            to_edge=replacement["edge"], at=list(target),
+                            reason="obsolete_support", length_mm=travel)
+        reserve_target = None
+        if active_candidates is not None:
+            reserve_target = _contour_projection(
+                target, contour, clockwise,
+                active_candidates["reserve"], spacing)
+        if (branch.get("contour_guided", False) and
+                current_target["backward"] and
+                (reserve_target is None or reserve_target["backward"])):
+            _record(journal, "contour_backward_segment_rejected",
+                    branch=side, round=round_index,
+                    candidate=name, at=list(target))
+            continue
+        selected_candidate = None
+        if active_candidates is not None:
+            return_direction = active_candidates["return_direction"]
+            if (abs(direction[0] - return_direction[0]) <= TOLERANCE and
+                    abs(direction[1] - return_direction[1]) <= TOLERANCE and
+                    not current_target["backward"]):
+                selected_candidate = "current"
+            elif (name == ("right" if clockwise else "left") and
+                  not reserve_target["backward"]):
+                selected_candidate = "reserve"
+            elif current_target["backward"]:
+                selected_candidate = "reserve"
+            elif reserve_target["backward"] or name != "forward":
+                selected_candidate = "current"
+            if selected_candidate == "reserve":
+                branch["contour_anchor"] = active_candidates["reserve"]
+                current_target = reserve_target
+            if selected_candidate is not None:
+                branch["contour_candidates"] = None
+                _record(journal, "contour_candidate_selected",
+                        branch=side, round=round_index,
+                        selected=selected_candidate, at=list(target),
+                        selected_target=current_target)
+        previous_anchor = (branch.get("contour_anchor") or
+                           _contour_projection(point, contour, clockwise))
+        next_tangent = (_next_contour_tangent(
+            previous_anchor, contour, clockwise)
+            if branch.get("contour_guided", False) and
+            previous_anchor is not None else None)
+        corner_candidate = (name != "forward" and next_tangent is not None and
+                       branch.get("last_blocker") in
+                       ("other_branch", "same_branch",
+                        "first_turn_reservation") and
+                       abs(direction[0] - next_tangent[0]) <= TOLERANCE and
+                       abs(direction[1] - next_tangent[1]) <= TOLERANCE)
+        deferred_corner = (corner_candidate and blocked_tangent and
+                           preferred_selected and active_candidates is None)
+        pipe_corner = corner_candidate and not deferred_corner
+        branch["contour_anchor"] = (
+            current_target if selected_candidate is not None or
+            current_target["edge"] != previous_anchor["edge"] else _contour_projection(
+                target, contour, clockwise, previous_anchor, spacing,
+                force_next=pipe_corner))
+        if pipe_corner:
+            _record(journal, "contour_pipe_corner_transition",
+                    branch=side, round=round_index,
+                    blocker=branch["last_blocker"],
+                    blocker_segment=branch.get("last_blocker_segment"),
+                    from_edge=previous_anchor["edge"],
+                    to_edge=branch["contour_anchor"]["edge"],
+                    at=list(target))
+        if deferred_corner:
+            branch["contour_candidates"] = {
+                "return_direction": contour_tangent,
+                "reserve": _contour_projection(
+                    target, contour, clockwise, previous_anchor,
+                    spacing, force_next=True)}
+            _record(journal, "contour_candidates_created",
+                    branch=side, round=round_index, at=list(target),
+                    current=branch["contour_anchor"],
+                    reserve=branch["contour_candidates"]["reserve"])
+        elif active_candidates is not None and branch.get(
+                "contour_candidates") is not None:
+            branch["contour_candidates"]["reserve"] = reserve_target
         merged = _append_branch_segment(branch, target)
         branch["heading"] = direction
         branch["last_blocker"] = (result["blocker"] if
                                   abs(travel - result["available_mm"]) <= TOLERANCE
                                   else "intermediate_turn")
+        branch["last_blocker_segment"] = (
+            result.get("blocker_segment") if
+            abs(travel - result["available_mm"]) <= TOLERANCE else None)
         if name != "forward":
             branch["turns_used"] += 1
         _record(journal, "segment", branch=side, round=round_index,
@@ -859,6 +1310,15 @@ def _finish_route(branches, contour, spacing, min_segment, journal,
                                       (_distance(*item[3]) if item[3] else 0.0),
                                       0 if item[0] == preferred_alignment else 1))
     for name, right_end, left_end, bridge in candidates:
+        right_run = ((right_end[0] - rp[0]) * (re[0] - rp[0]) +
+                     (right_end[1] - rp[1]) * (re[1] - rp[1]))
+        left_run = ((left_end[0] - lp[0]) * (le[0] - lp[0]) +
+                    (left_end[1] - lp[1]) * (le[1] - lp[1]))
+        if right_run <= TOLERANCE or left_run <= TOLERANCE:
+            _record(journal, "join_probe", candidate=name,
+                    right_end=list(right_end), left_end=list(left_end),
+                    accepted=False, reason="reversed_last_segment")
+            continue
         proposed_right = right[:-1] + [right_end]
         proposed_left = left[:-1] + [left_end]
         valid, reason = _valid_join(proposed_right, proposed_left, bridge,
@@ -984,7 +1444,7 @@ def _recovery_checkpoints(original, first_side, contour, spacing,
                    for segment in zip(contour, contour[1:] + contour[:1]))
     anchors = []
     for turn_priority, (turn_name, direction) in enumerate(
-            (side_order[0], side_order[2])):
+            item for item in side_order if item[0] != "forward"):
         for kind, side, segment in sources:
             a, b = segment
             if abs(a[axis] - b[axis]) > TOLERANCE:
@@ -1040,7 +1500,8 @@ def _recover_pair_side(snapshots, first_side, second_side, contour,
                 original[second_side]["turns_used"] >= max_turns):
             continue
         index = 0 if abs(first_heading[0]) > TOLERANCE else 1
-        side_order = _directions(first_heading, clockwise)
+        side_order = _contour_directions(
+            original[first_side], contour, clockwise, spacing)
         checkpoints = _recovery_checkpoints(
             original, first_side, contour, spacing, side_order)
         for checkpoint in checkpoints:
@@ -1060,7 +1521,9 @@ def _recover_pair_side(snapshots, first_side, second_side, contour,
                 continue
             second_point = _advance(second_segment[0], second_heading,
                                     second_distance)
-            for turn_name, turn_direction in (side_order[0], side_order[2]):
+            for turn_name, turn_direction in side_order:
+                if turn_name == "forward":
+                    continue
                 if turn_name != allowed_turn:
                     continue
                 if (checkpoint["turn"] is not None and
@@ -1083,6 +1546,8 @@ def _recover_pair_side(snapshots, first_side, second_side, contour,
                     branch = trial[side]
                     branch["vertices"][-1] = point
                     branch["segments"][-1] = (branch["segments"][-1][0], point)
+                    branch["contour_anchor"] = _contour_projection(
+                        point, contour, clockwise)
                     branch["stop_reason"] = None
                     branch["pending_turn"] = turn_name
                 if minimum_turn_room is not None:
@@ -1209,7 +1674,7 @@ def _recover_pair_forward(snapshot, first_side, second_side, contour,
             first_moved=first_moved, second_moved=second_moved,
             choices={event["branch"]: event["choice"] for event in moves},
             connected=join["connected"])
-    if not parallel_forward or not join["connected"]:
+    if not parallel_forward:
         return None, None, None
     details = {"from_round": snapshot["round"],
                "to_round": snapshot["round"] + 1,
@@ -1219,8 +1684,10 @@ def _recover_pair_forward(snapshot, first_side, second_side, contour,
         previous = snapshot["branches"][side]
         prior_obstacles = _obstacles(snapshot["branches"][other_side],
                                     "other_branch")
-        primary_name, primary_direction = _directions(
-            previous["heading"], clockwise)[0]
+        ordered = _contour_directions(previous, contour, clockwise, spacing)
+        if not ordered:
+            continue
+        primary_name, primary_direction = ordered[0]
         rejected = probe_ray(previous["vertices"][-1], primary_direction,
                              contour, previous["segments"], prior_obstacles,
                              spacing)
@@ -1245,9 +1712,77 @@ def _recover_pair_turn(snapshots, first_side, second_side, contour,
                        excluded=None):
     if not snapshots:
         return None, None, None
-    heading = snapshots[-1]["branches"][first_side]["heading"]
-    order = [item[0] for item in _directions(heading, clockwise)]
     for snapshot in reversed(snapshots):
+        order = [item[0] for item in _contour_directions(
+            snapshot["branches"][first_side], contour, clockwise, spacing)]
+        rejected = set(event["choice"] for event in journal
+                       if event["action"] == "segment" and
+                       event.get("round") == snapshot["round"] + 1 and
+                       event.get("branch") == first_side)
+        for choice in order:
+            if choice in rejected:
+                continue
+            key = (snapshot["round"], "vertex", choice)
+            if excluded is not None and key in excluded:
+                continue
+            trial = copy.deepcopy(snapshot["branches"])
+            first = trial[first_side]
+            second = trial[second_side]
+            first["stop_reason"] = None
+            second["stop_reason"] = None
+            first["pending_turn"] = choice
+            first["recovery_only_direction"] = choice
+            probe_log = []
+            first_moved = _walk_one(
+                first, first_side, contour,
+                _obstacles(second, "other_branch"), spacing, offset,
+                min_segment, max_turns, probe_log,
+                snapshot["round"] + 1, clockwise)
+            moves = [event for event in probe_log
+                     if event["action"] == "segment"]
+            _record(journal, "pair_vertex_probe", round=snapshot["round"],
+                    candidate=choice, first_moved=first_moved,
+                    first_choice=(moves[0]["choice"] if moves else None))
+            if not first_moved or not moves or moves[0]["choice"] != choice:
+                continue
+            reservation = _next_reservation(
+                first, contour, _obstacles(second, "other_branch"),
+                spacing, offset, min_segment, max_turns, probe_log,
+                first_side, clockwise)
+            obstacles = _obstacles(first, "other_branch")
+            if reservation is not None:
+                obstacles.append({"segment": reservation,
+                                  "kind": "first_turn_reservation"})
+            second_moved = _walk_one(
+                second, second_side, contour, obstacles, spacing, offset,
+                min_segment, max_turns, probe_log,
+                snapshot["round"] + 1, clockwise)
+            _record(journal, "pair_vertex_second_probe",
+                    round=snapshot["round"], candidate=choice,
+                    second_moved=second_moved)
+            if not second_moved:
+                continue
+            joined = _finish_route(copy.deepcopy(trial), contour, spacing,
+                                   min_segment, probe_log, first_side)
+            _record(journal, "pair_vertex_join_probe",
+                    round=snapshot["round"], candidate=choice,
+                    connected=joined["connected"],
+                    reason=joined.get("reason"))
+            if not joined["connected"]:
+                continue
+            details = {"from_round": snapshot["round"],
+                       "to_round": snapshot["round"] + 1,
+                       "turn": choice,
+                       "reason": "paired_vertex_recovery"}
+            _record(journal, "pair_vertex_recovery", **details)
+            if excluded is not None:
+                excluded.add(key)
+            for event in probe_log:
+                event = dict(event)
+                event.pop("step", None)
+                _record(journal, "recovery_" + event.pop("action"),
+                        **event)
+            return trial, joined, details
         for choice in order:
             if choice == "forward":
                 result = _recover_pair_forward(
@@ -1347,6 +1882,8 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                      for side in ("right", "left")}
     last_turns = {side: branches[side]["turns_used"]
                   for side in ("right", "left")}
+    last_anchors = {side: branches[side].get("contour_anchor")
+                    for side in ("right", "left")}
     pair_diverged = False
     continuation_round = start_round
     if (start_round < max_rounds and
@@ -1373,6 +1910,8 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                                  for side in ("right", "left")}
                 last_turns = {side: branches[side]["turns_used"]
                               for side in ("right", "left")}
+                last_anchors = {side: branches[side].get("contour_anchor")
+                                for side in ("right", "left")}
             continuation_round += 2
         else:
             _record(journal, "recovery_lead_unavailable",
@@ -1407,12 +1946,57 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
         _record(journal, "recovery_continuation", round=round_index,
                 first_moved=first_moved, second_moved=second_moved,
                 connected=candidate_join["connected"])
-        if first_moved and second_moved and candidate_join["connected"]:
+        if (candidate_join["connected"] and
+                first_moved != second_moved and
+                branches[first_side]["turns_used"] ==
+                branches[second_side]["turns_used"] and
+                not _walk_one(
+                    copy.deepcopy(branches[first_side if first_moved else
+                                           second_side]),
+                    first_side if first_moved else second_side,
+                    contour,
+                    _obstacles(branches[second_side if first_moved else
+                                        first_side], "other_branch"),
+                    spacing, offset, min_segment, max_turns, [],
+                    round_index + 1, clockwise)):
+            first_vertices = trial[first_side]["vertices"]
+            second_end = trial[second_side]["vertices"][-1]
+            turn_direction = (_right(branches[first_side]["heading"])
+                              if clockwise else
+                              _left(branches[first_side]["heading"]))
+            turn_run = ((second_end[0] - first_vertices[-1][0]) *
+                        turn_direction[0] +
+                        (second_end[1] - first_vertices[-1][1]) *
+                        turn_direction[1])
+            if (turn_run > min_segment + TOLERANCE and
+                    _distance(_advance(first_vertices[-1],
+                                       turn_direction, turn_run),
+                              second_end) <= TOLERANCE):
+                direct = copy.deepcopy(trial)
+                direct[first_side]["vertices"].append(second_end)
+                valid, reason = _valid_join(
+                    direct["right"]["vertices"],
+                    direct["left"]["vertices"], None, contour,
+                    spacing, min_segment)
+                if valid:
+                    direct[first_side]["turns_used"] += 1
+                    trial = direct
+                    candidate_join = {"connected": True,
+                                      "method": "terminal_turn",
+                                      "bridge": None}
+            branches.clear()
+            branches.update(trial)
+            _record(journal, "recovery_terminal_pair_complete",
+                    round=round_index, method=candidate_join["method"])
+            return candidate_join, latest_recovery
+        if (first_moved or second_moved) and candidate_join["connected"]:
             last_join = candidate_join
             last_vertices = {side: list(trial[side]["vertices"])
                              for side in ("right", "left")}
             last_turns = {side: branches[side]["turns_used"]
                           for side in ("right", "left")}
+            last_anchors = {side: branches[side].get("contour_anchor")
+                            for side in ("right", "left")}
         tight_sides = []
         if (first_moved and second_moved and
                 first["turns_used"] < max_turns and
@@ -1451,18 +2035,23 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 branches.update(recovered)
                 snapshots = []
                 joined_trial = copy.deepcopy(branches)
-                last_join = _finish_route(joined_trial, contour, spacing,
-                                          min_segment, journal, first_side)
-                last_vertices = {side: list(joined_trial[side]["vertices"])
-                                 for side in ("right", "left")}
-                last_turns = {side: branches[side]["turns_used"]
-                              for side in ("right", "left")}
+                candidate_join = _finish_route(
+                    joined_trial, contour, spacing, min_segment,
+                    journal, first_side)
+                if candidate_join["connected"]:
+                    last_join = candidate_join
+                    last_vertices = {side: list(joined_trial[side]["vertices"])
+                                     for side in ("right", "left")}
+                    last_turns = {side: branches[side]["turns_used"]
+                                  for side in ("right", "left")}
+                    last_anchors = {side: branches[side].get("contour_anchor")
+                                    for side in ("right", "left")}
                 _record(journal, "paired_turn_room_recovery_selected",
                         round=round_index, tight_branches=tight_sides,
                         inbound_headings=inbound_headings, **details)
                 latest_recovery = details
                 continue
-        if (first_moved != second_moved or
+        if ((first_moved and not second_moved) or
                 (not first_moved and not second_moved) or
                 (first["stop_reason"] is not None and
                  second["stop_reason"] is not None)):
@@ -1481,6 +2070,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
         for side in ("right", "left"):
             branches[side]["vertices"] = last_vertices[side]
             branches[side]["turns_used"] = last_turns[side]
+            branches[side]["contour_anchor"] = last_anchors[side]
             branches[side]["stop_reason"] = "pair_rollback"
         _record(journal, "recovery_continuation_rollback",
                 turns_by_branch=last_turns,
@@ -1492,10 +2082,11 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
     return final_join, latest_recovery
 
 
-def build_vector_route(polygon, right_start, left_start, entry_direction,
-                       max_turns, offset_mm=200.0, spacing_mm=150.0,
-                       min_segment_mm=1.0, max_rounds=500,
-                       clockwise=False):
+def _build_vector_route_once(polygon, right_start, left_start,
+                             entry_direction, max_turns, offset_mm=200.0,
+                             spacing_mm=150.0, min_segment_mm=1.0,
+                             max_rounds=500, clockwise=False,
+                             contour_guided=False):
     """Alternate branches; try right, forward, and left in that order."""
     if isinstance(max_turns, bool) or int(max_turns) != max_turns or max_turns < 0:
         raise ValueError("max_turns_must_be_nonnegative_integer")
@@ -1518,6 +2109,9 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
             spacing_mm=spacing_mm, max_turns=max_turns,
             min_segment_mm=min_segment_mm,
             clockwise=clockwise,
+            contour_guided=contour_guided,
+            direction_policy=("contour_progress" if contour_guided else
+                              "heading_priority"),
             direction_order=(["left", "forward", "right"] if clockwise else
                              ["right", "forward", "left"]))
     _record(journal, "offset_contour",
@@ -1528,6 +2122,35 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
     entry_targets = _paired_entry_alignment(
         polygon, contour, starts, normal, first_side, second_side,
         offset_mm, spacing_mm, clockwise, journal)
+    if contour_guided:
+        entry = entry_targets.get(first_side)
+        if entry is None:
+            entry = _correct_entry(
+                _entry_at_depth(polygon, starts[first_side], normal,
+                                offset_mm), normal, contour, spacing_mm)
+        anchor = _contour_projection(entry, contour, clockwise)
+        tangent = _contour_tangent(anchor, contour, clockwise)
+        if tangent is not None and anchor["distance"] <= TOLERANCE:
+            distance = _ray_boundary_distance(entry, tangent, contour)
+            if min_segment_mm + TOLERANCE < distance < spacing_mm - TOLERANCE:
+                corner = _advance(entry, tangent, distance)
+                next_anchor = _contour_projection(
+                    corner, contour, clockwise, anchor, spacing_mm,
+                    force_next=True)
+                if (next_anchor["along"] <= TOLERANCE and
+                        next_anchor["distance"] <= TOLERANCE):
+                    starts = {side: _advance(start, tangent, distance)
+                              for side, start in starts.items()}
+                    journal[0]["right_start"] = list(starts["right"])
+                    journal[0]["left_start"] = list(starts["left"])
+                    _record(journal, "start_pair_shift", distance_mm=distance,
+                            direction=list(tangent),
+                            right=list(starts["right"]),
+                            left=list(starts["left"]))
+                    entry_targets = _paired_entry_alignment(
+                        polygon, contour, starts, normal, first_side,
+                        second_side, offset_mm, spacing_mm, clockwise,
+                        journal)
     branches = {}
     for side, depth in ((first_side, offset_mm),
                         (second_side, offset_mm + spacing_mm)):
@@ -1535,6 +2158,13 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
                                          normal, depth, spacing_mm,
                                          side, journal,
                                          entry_targets.get(side))
+        branches[side]["contour_guided"] = contour_guided
+        if contour_guided:
+            branches[side]["contour_anchor"] = _contour_projection(
+                branches[side]["vertices"][-1], contour, clockwise)
+            _record(journal, "contour_anchor_start", branch=side,
+                    at=list(branches[side]["vertices"][-1]),
+                    anchor=branches[side]["contour_anchor"])
     last_pair_checkpoint = None
     pair_snapshots = []
     early_recovery = None
@@ -1556,6 +2186,35 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
         if reservation is not None:
             second_obstacles.append({"segment": reservation,
                                      "kind": "first_turn_reservation"})
+        if (contour_guided and reservation is not None and
+                first.get("pending_turn") is None):
+            reserved_direction = (
+                (reservation[1][0] - reservation[0][0]) /
+                _distance(*reservation),
+                (reservation[1][1] - reservation[0][1]) /
+                _distance(*reservation))
+            for name, direction in _contour_directions(
+                    first, contour, clockwise, spacing_mm):
+                if name == "forward" or direction == reserved_direction:
+                    continue
+                alternative = probe_ray(
+                    first["vertices"][-1], direction, contour,
+                    first["segments"], _obstacles(second, "other_branch"),
+                    spacing_mm)
+                required = (offset_mm if alternative["blocker"] ==
+                            "boundary" else spacing_mm)
+                if _can_travel(alternative["available_mm"], required,
+                               min_segment_mm):
+                    end = _advance(first["vertices"][-1], direction,
+                                   min(spacing_mm,
+                                       alternative["available_mm"]))
+                    second_obstacles.append({
+                        "segment": (first["vertices"][-1], end),
+                        "kind": "first_turn_reservation"})
+                    _record(journal, "reserve_alternative_turn",
+                            branch=first_side, candidate=name,
+                            start=list(first["vertices"][-1]),
+                            end=list(end))
         second_moved = _walk_one(second, second_side, contour,
                                  second_obstacles, spacing_mm,
                                  offset_mm,
@@ -1580,7 +2239,9 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
                 "vertices": {side: list(trial[side]["vertices"])
                              for side in ("right", "left")},
                 "turns": {side: branches[side]["turns_used"]
-                          for side in ("right", "left")}}
+                          for side in ("right", "left")},
+                "anchors": {side: branches[side].get("contour_anchor")
+                            for side in ("right", "left")}}
             _record(journal, "pair_checkpoint_saved", round=round_index,
                     turns_by_branch=last_pair_checkpoint["turns"])
         tight_sides = []
@@ -1671,6 +2332,7 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
         for side in ("right", "left"):
             branches[side]["vertices"] = last_pair_checkpoint["vertices"][side]
             branches[side]["turns_used"] = last_pair_checkpoint["turns"][side]
+            branches[side]["contour_anchor"] = last_pair_checkpoint["anchors"][side]
             branches[side]["stop_reason"] = "pair_rollback"
         join = last_pair_checkpoint["join"]
         _record(journal, "pair_rollback", **rollback)
@@ -1692,3 +2354,36 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
             "stop_reason": reasons, "join": join,
             "rollback": rollback, "abandoned_segments": abandoned,
             "validated": False}
+
+
+def build_vector_route(polygon, right_start, left_start, entry_direction,
+                       max_turns, offset_mm=200.0, spacing_mm=150.0,
+                       min_segment_mm=1.0, max_rounds=500,
+                       clockwise=False, contour_guided=False):
+    arguments = (polygon, right_start, left_start, entry_direction,
+                 max_turns, offset_mm, spacing_mm, min_segment_mm,
+                 max_rounds, clockwise)
+    route = _build_vector_route_once(*(arguments + (contour_guided,)))
+    if not contour_guided:
+        return route
+    failure = None
+    if not route["join"]["connected"]:
+        failure = route["join"].get("reason", "no_join")
+    else:
+        try:
+            start_at_calculated_entries(copy.deepcopy(route))
+        except ValueError as error:
+            failure = error.args[0] if error.args else "invalid_entry"
+    if failure is None:
+        return route
+    established = _build_vector_route_once(*(arguments + (False,)))
+    if established["join"]["connected"]:
+        try:
+            start_at_calculated_entries(copy.deepcopy(established))
+        except ValueError:
+            pass
+        else:
+            _record(established["journal"], "contour_route_fallback",
+                    reason=failure)
+            return established
+    return route
