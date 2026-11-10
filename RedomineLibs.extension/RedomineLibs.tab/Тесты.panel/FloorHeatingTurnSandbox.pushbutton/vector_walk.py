@@ -699,11 +699,13 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
     tight_after = (_paired_turn_room(trial, contour, spacing, offset,
                                      probe_log, round_index + 1)
                    if first_moved and second_moved else [])
-    if first_moved and second_moved and equal_turns and not tight_after:
+    # A terminal join needs no room for another paired turn. Keep tight_after
+    # as diagnostics only; _finish_route validates the actual final geometry.
+    if first_moved and second_moved and equal_turns:
         join = _finish_route(trial, contour, spacing, min_segment,
                              probe_log, first_side)
     accepted = (first_moved and second_moved and equal_turns and
-                join["connected"] and not tight_after)
+                join["connected"])
     _record(journal, "terminal_pair_probe", round=round_index + 1,
             first_moved=first_moved, second_moved=second_moved,
             equal_turns=equal_turns, connected=join["connected"],
@@ -1335,6 +1337,72 @@ def _finish_route(branches, contour, spacing, min_segment, journal,
     return {"connected": False, "reason": "no_valid_orthogonal_join"}
 
 
+def _simplify_terminal_route(branches, join, contour, spacing,
+                             min_segment, journal):
+    """Delay a terminal corner across a redundant monotone stair step.
+
+    Compare equal-length orthogonal paths with the same endpoints. Removing
+    two bends is allowed only when the replacement stays inside the contour
+    and the complete joined route still meets pipe clearance.
+    """
+    if not join.get("connected"):
+        return
+    for side, other in (("right", "left"), ("left", "right")):
+        branch = branches[side]
+        while len(branch["vertices"]) >= 5:
+            vertices = branch["vertices"]
+            tail = vertices[-5:]
+            vectors = [(b[0] - a[0], b[1] - a[1])
+                       for a, b in zip(tail, tail[1:])]
+            directions = []
+            for dx, dy in vectors:
+                if abs(dx) <= TOLERANCE and abs(dy) > TOLERANCE:
+                    directions.append((0, 1 if dy > 0 else -1))
+                elif abs(dy) <= TOLERANCE and abs(dx) > TOLERANCE:
+                    directions.append((1 if dx > 0 else -1, 0))
+                else:
+                    break
+            if (len(directions) != 4 or directions[0] != directions[2] or
+                    directions[1] != directions[3] or
+                    directions[0][0] * directions[1][0] +
+                    directions[0][1] * directions[1][1] != 0):
+                break
+            corner = (tail[1][0] + vectors[2][0],
+                      tail[1][1] + vectors[2][1])
+            proposed = vertices[:-4] + [corner, tail[-1]]
+            valid, reason = True, None
+            # _valid_join normally checks only the resized final segment.
+            # Here the preceding segment moves too, so check both new runs.
+            for a, b in zip(proposed[-3:], proposed[-2:]):
+                length = _distance(a, b)
+                direction = ((b[0] - a[0]) / length,
+                             (b[1] - a[1]) / length)
+                if (not _inside(a, contour) or not _inside(b, contour) or
+                        length > _ray_boundary_distance(a, direction, contour)
+                        + TOLERANCE):
+                    valid, reason = False, "outside_contour"
+                    break
+            if valid:
+                right = proposed if side == "right" else branches[other]["vertices"]
+                left = proposed if side == "left" else branches[other]["vertices"]
+                valid, reason = _valid_join(right, left, join.get("bridge"),
+                                            contour, spacing, min_segment)
+            _record(journal, "terminal_corner_probe", branch=side,
+                    old_corner=list(tail[1]), new_corner=list(corner),
+                    delay_mm=_distance(tail[1], corner), accepted=valid,
+                    reason=reason)
+            if not valid:
+                break
+            branch["vertices"] = proposed
+            branch["segments"] = list(zip(proposed, proposed[1:]))
+            branch["heading"] = directions[-1]
+            branch["turns_used"] -= 2
+            _record(journal, "terminal_corner_delayed", branch=side,
+                    old_tail=[list(p) for p in tail],
+                    new_tail=[list(p) for p in proposed[-3:]],
+                    delay_mm=_distance(tail[1], corner), removed_turns=2)
+
+
 def _abandoned_segments(journal, branches, join, min_segment):
     """Visible portions of built segments absent from the final route."""
     kept = []
@@ -1869,9 +1937,96 @@ def _lead_then_catch(branches, first_side, second_side, contour,
     return trial, paired_snapshot, log
 
 
+def _search_pair_completion(branches, snapshots, first_side, second_side,
+                            contour, spacing, offset, min_segment, max_turns,
+                            max_rounds, clockwise, round_index, journal):
+    """Keep a safe finish while testing independent recovery continuations.
+
+    At fixed spacing, extra valid route length represents additional coverage.
+    A connectable recovery alone is not progress: compare its completed route
+    with the saved finish, including the bridge, before committing anything.
+    """
+    def length(candidate, join):
+        return (route_length_mm(candidate) +
+                (_distance(*join["bridge"]) if join.get("bridge") else 0.0))
+
+    best = copy.deepcopy(branches)
+    best_log = []
+    best_join = _finish_route(best, contour, spacing, min_segment,
+                              best_log, first_side)
+    best_length = length(best, best_join) if best_join["connected"] else -1.0
+    terminal_log = []
+    terminal, terminal_join = _terminal_pair_without_reservation(
+        branches, first_side, second_side, contour, spacing, offset,
+        min_segment, max_turns, clockwise, terminal_log, round_index)
+    if terminal is not None and length(terminal, terminal_join) >= best_length:
+        best, best_join, best_log = terminal, terminal_join, terminal_log
+        best_length = length(best, best_join)
+    excluded = set()
+    selected_details = None
+    attempt = 0
+    # Bound speculative walking by the same caller-supplied round limit as
+    # normal routing. Candidate probes share this budget, never recurse.
+    search_budget = [max_rounds]
+    while search_budget[0] > 0:
+        search_budget[0] -= 1
+        # Trial events must not affect rejection filters of later candidates.
+        trial_log = list(journal)
+        log_start = len(trial_log)
+        recovered, recovered_join, details = _recover_pair_turn(
+            snapshots, first_side, second_side, contour, spacing, offset,
+            min_segment, max_turns, clockwise, trial_log, excluded=excluded)
+        if recovered is None:
+            break
+        attempt += 1
+        if details["turn"] != "forward":
+            source = next(s["branches"] for s in snapshots
+                          if s["round"] == details["from_round"])
+            for side in (first_side, second_side):
+                recovered[side]["returning_from_protrusion"] = source[side]["heading"]
+        completed_join, later_details = _continue_after_recovery(
+            recovered, first_side, second_side, contour, spacing, offset,
+            min_segment, max_turns, max_rounds, clockwise,
+            details["to_round"] + 1, trial_log, search_alternatives=False,
+            search_budget=search_budget)
+        valid, reason = (False, completed_join.get("reason"))
+        if completed_join["connected"]:
+            valid, reason = _valid_join(
+                recovered["right"]["vertices"], recovered["left"]["vertices"],
+                completed_join.get("bridge"), contour, spacing, min_segment)
+        completed_length = length(recovered, completed_join) if valid else 0.0
+        improves = valid and completed_length > best_length + TOLERANCE
+        _record(journal, "recovery_completion_probe", attempt=attempt,
+                from_round=details["from_round"], candidate=details,
+                connected=completed_join["connected"], valid=valid,
+                reason=(reason if not valid else
+                        None if improves else "no_additional_coverage"),
+                length_mm=completed_length,
+                fallback_length_mm=best_length, accepted=improves)
+        if improves:
+            best, best_join = recovered, completed_join
+            best_log = trial_log[log_start:]
+            selected_details = later_details or details
+            break
+    if search_budget[0] <= 0:
+        _record(journal, "recovery_search_limit", max_rounds=max_rounds,
+                attempts=attempt)
+    if not best_join["connected"]:
+        return None, None, None
+    for event in best_log:
+        event = dict(event)
+        event.pop("step", None)
+        _record(journal, event.pop("action"), **event)
+    _record(journal, "pair_completion_selected", round=round_index,
+            method=("recovery_continuation" if selected_details else "saved_finish"),
+            attempts=attempt, length_mm=length(best, best_join))
+    return best, best_join, selected_details
+
+
 def _continue_after_recovery(branches, first_side, second_side, contour,
                              spacing, offset, min_segment, max_turns,
-                             max_rounds, clockwise, start_round, journal):
+                             max_rounds, clockwise, start_round, journal,
+                             search_alternatives=True, search_budget=None):
     snapshots = []
     used_recoveries = set()
     latest_recovery = None
@@ -1920,6 +2075,10 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                             event["action"] in ("recovery_lead_forward_probe",
                                                 "recovery_follow_forward_probe")])
     for round_index in range(continuation_round, max_rounds + 1):
+        if search_budget is not None:
+            if search_budget[0] <= 0:
+                break
+            search_budget[0] -= 1
         first = branches[first_side]
         second = branches[second_side]
         first_moved = _walk_one(first, first_side, contour,
@@ -2012,6 +2171,15 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                         round=round_index, tight_branches=tight_sides)
                 tight_sides = []
             else:
+                if search_alternatives:
+                    completed, completed_join, details = _search_pair_completion(
+                        branches, snapshots, first_side, second_side, contour,
+                        spacing, offset, min_segment, max_turns, max_rounds,
+                        clockwise, round_index, journal)
+                    if completed is not None:
+                        branches.clear()
+                        branches.update(completed)
+                        return completed_join, details or latest_recovery
                 terminal, terminal_join = _terminal_pair_without_reservation(
                     branches, first_side, second_side, contour, spacing,
                     offset, min_segment, max_turns, clockwise, journal,
@@ -2167,7 +2335,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
                     anchor=branches[side]["contour_anchor"])
     last_pair_checkpoint = None
     pair_snapshots = []
-    early_recovery = None
+    resolved_completion = None
     for round_index in range(1, max_rounds + 1):
         first = branches[first_side]
         second = branches[second_side]
@@ -2260,32 +2428,14 @@ def _build_vector_route_once(polygon, right_start, left_start,
                         round=round_index, tight_branches=tight_sides)
                 tight_sides = []
             else:
-                terminal, terminal_join = _terminal_pair_without_reservation(
-                    branches, first_side, second_side, contour, spacing_mm,
-                    offset_mm, min_segment_mm, max_turns, clockwise,
-                    journal, round_index)
-                if terminal is not None:
-                    branches = terminal
-                    _record(journal, "terminal_pair_complete",
-                            round=round_index + 1,
-                            method=terminal_join["method"])
+                completed, completed_join, details = _search_pair_completion(
+                    branches, pair_snapshots, first_side, second_side, contour,
+                    spacing_mm, offset_mm, min_segment_mm, max_turns,
+                    max_rounds, clockwise, round_index, journal)
+                if completed is not None:
+                    branches = completed
+                    resolved_completion = (completed_join, details)
                     break
-        if tight_sides:
-            inbound_headings = {side: branches[side]["heading"]
-                                for side in ("right", "left")}
-            recovered, recovered_join, details = _recover_pair_turn(
-                pair_snapshots, first_side, second_side, contour,
-                spacing_mm, offset_mm, min_segment_mm, max_turns,
-                clockwise, journal)
-            if recovered is not None:
-                if details["turn"] != "forward":
-                    for side in ("right", "left"):
-                        recovered[side]["returning_from_protrusion"] = inbound_headings[side]
-                early_recovery = (recovered, recovered_join, details)
-                _record(journal, "paired_turn_room_recovery_selected",
-                        round=round_index, tight_branches=tight_sides,
-                        inbound_headings=inbound_headings, **details)
-                break
         if first_moved != second_moved:
             _record(journal, "pair_progress_diverged", round=round_index,
                     first_moved=first_moved, second_moved=second_moved)
@@ -2302,14 +2452,8 @@ def _build_vector_route_once(polygon, right_start, left_start,
                 _record(journal, "branch_stop", branch=side,
                         reason="round_limit", max_rounds=max_rounds)
     rollback = None
-    if early_recovery is not None:
-        branches, recovered_join, rollback = early_recovery
-        join, continued_rollback = _continue_after_recovery(
-            branches, first_side, second_side, contour, spacing_mm,
-            offset_mm, min_segment_mm, max_turns, max_rounds,
-            clockwise, rollback["to_round"] + 1, journal)
-        if continued_rollback is not None:
-            rollback = continued_rollback
+    if resolved_completion is not None:
+        join, rollback = resolved_completion
     else:
         join = _finish_route(branches, contour, spacing_mm,
                              min_segment_mm, journal, first_side)
@@ -2336,6 +2480,8 @@ def _build_vector_route_once(polygon, right_start, left_start,
             branches[side]["stop_reason"] = "pair_rollback"
         join = last_pair_checkpoint["join"]
         _record(journal, "pair_rollback", **rollback)
+    _simplify_terminal_route(branches, join, contour, spacing_mm,
+                             min_segment_mm, journal)
     abandoned = (_abandoned_segments(journal, branches, join,
                                      min_segment_mm)
                  if rollback is not None else [])
