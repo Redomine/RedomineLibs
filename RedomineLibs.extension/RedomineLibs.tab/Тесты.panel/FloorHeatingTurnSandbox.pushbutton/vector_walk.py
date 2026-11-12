@@ -362,6 +362,12 @@ def _contour_directions(branch, contour, clockwise, spacing):
         anchor = _contour_projection(point, contour, clockwise)
     if anchor is None:
         return list(_directions(branch["heading"], clockwise))
+    if (branch.get("rebind_inner_support", False) and
+            anchor["distance"] >= 2.0 * spacing - TOLERANCE):
+        support = _contour_heading_support(point, branch["heading"], contour, clockwise, anchor)
+        if support is not None:
+            anchor = support
+            branch["contour_anchor"] = support
     next_tangent = _next_contour_tangent(anchor, contour, clockwise)
     next_anchor = _contour_projection(
         point, contour, clockwise, anchor, force_next=True)
@@ -1266,6 +1272,8 @@ def _valid_join(right, left, bridge, contour, spacing, min_segment):
                 return False, "short_segment"
             direction = ((segment[1][0] - segment[0][0]) / length,
                          (segment[1][1] - segment[0][1]) / length)
+            if abs(direction[0]) > TOLERANCE and abs(direction[1]) > TOLERANCE:
+                return False, "nonorthogonal_segment"
             if index == len(vertices) - 1 and (
                     not _inside(segment[1], contour) or
                     length > _ray_boundary_distance(segment[0], direction,
@@ -1541,6 +1549,11 @@ def _simplify_pair_route(branches, join, contour, spacing, min_segment, journal,
 
 def _abandoned_segments(journal, branches, join, min_segment):
     """Visible portions of built segments absent from the final route."""
+    # These events describe the current final geometry, not route history.
+    # A later completion can retain formerly abandoned portions, so replace
+    # the derived events rather than appending a second diagnostic snapshot.
+    journal[:] = [event for event in journal if event["action"] not in
+                  ("abandoned_segment", "abandoned_segment_skipped")]
     kept = []
     for side in ("right", "left"):
         vertices = branches[side]["vertices"]
@@ -2406,7 +2419,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
                              entry_direction, max_turns, offset_mm=200.0,
                              spacing_mm=150.0, min_segment_mm=1.0,
                              max_rounds=500, clockwise=False,
-                             contour_guided=False):
+                             contour_guided=False, rebind_inner_support=False):
     """Alternate branches; try right, forward, and left in that order."""
     if isinstance(max_turns, bool) or int(max_turns) != max_turns or max_turns < 0:
         raise ValueError("max_turns_must_be_nonnegative_integer")
@@ -2479,6 +2492,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
                                          side, journal,
                                          entry_targets.get(side))
         branches[side]["contour_guided"] = contour_guided
+        branches[side]["rebind_inner_support"] = rebind_inner_support
         if contour_guided:
             branches[side]["contour_anchor"] = _contour_projection(
                 branches[side]["vertices"][-1], contour, clockwise)
@@ -2656,6 +2670,95 @@ def _build_vector_route_once(polygon, right_start, left_start,
             "validated": False}
 
 
+def _complete_entry_bypass(route, normal, spacing, offset, minimum,
+                            max_turns, max_rounds, clockwise):
+    """Resume the incoming direction after a short paired entry bypass.
+
+    The follower can need an earlier corner while the leader clears the
+    entry. Test such corners on the step grid, keeping the leader's return
+    direction. Collinear checkpoint vertices must not become false corners.
+    """
+    first, second = ("left", "right") if clockwise else ("right", "left")
+    original = copy.deepcopy(route["branches"])
+    for branch in original.values():
+        vertices = []
+        for point in branch["vertices"]:
+            while len(vertices) >= 2:
+                a, b = vertices[-2:]
+                u, v = (b[0]-a[0], b[1]-a[1]), (point[0]-b[0], point[1]-b[1])
+                if (abs(u[0]*v[1]-u[1]*v[0]) > TOLERANCE or
+                        u[0]*v[0]+u[1]*v[1] <= 0):
+                    break
+                vertices.pop()
+            vertices.append(point)
+        if len(vertices) < 3:
+            return route
+        branch["vertices"] = vertices
+    vertices = original[first]["vertices"]
+    a, b, c = vertices[-3:]
+    length, incoming = _distance(b, c), _distance(a, b)
+    heading = ((c[0]-b[0])/length, (c[1]-b[1])/length)
+    resume = ((b[0]-a[0])/incoming, (b[1]-a[1])/incoming)
+    if (length > 2*spacing + TOLERANCE or _distance(heading, normal) > TOLERANCE
+            or abs(sum(heading[k]*resume[k] for k in (0, 1))) > TOLERANCE):
+        return route
+    best = route
+    best_length = route_length_mm(route["branches"]) + (
+        _distance(*route["join"]["bridge"]) if route["join"].get("bridge") else 0)
+    follower = original[second]["vertices"]
+    a, b = follower[-2:]
+    length = _distance(a, b)
+    heading = ((b[0]-a[0])/length, (b[1]-a[1])/length)
+    budget = [max_rounds]
+    for step in range(1, int((length-minimum)/spacing) + 1):
+        if budget[0] <= 0:
+            break
+        trial = copy.deepcopy(original)
+        trial[second]["vertices"][-1] = _advance(b, heading, -step*spacing)
+        possible = True
+        for side in (first, second):
+            branch = trial[side]
+            branch["segments"] = list(zip(branch["vertices"], branch["vertices"][1:]))
+            start, end = branch["segments"][-1]
+            distance = _distance(start, end)
+            branch["heading"] = ((end[0]-start[0])/distance, (end[1]-start[1])/distance)
+            choices = [name for name, direction in _directions(branch["heading"], clockwise)
+                       if _distance(direction, resume) <= TOLERANCE]
+            if not choices:
+                possible = False
+                break
+            branch.update(stop_reason=None, pending_turn=choices[0],
+                          recovery_only_direction=choices[0], contour_guided=False)
+        if not possible:
+            continue
+        log = []
+        join, details = _continue_after_recovery(trial, first, second,
+            route["contour"], spacing, offset, minimum, max_turns, max_rounds,
+            clockwise, 1, log, search_alternatives=False, search_budget=budget)
+        if not join.get("connected"):
+            continue
+        _simplify_pair_route(trial, join, route["contour"], spacing, minimum, log, first)
+        valid, reason = _valid_join(trial["right"]["vertices"], trial["left"]["vertices"],
+                                    join.get("bridge"), route["contour"], spacing, minimum)
+        length_mm = route_length_mm(trial) + (_distance(*join["bridge"]) if join.get("bridge") else 0)
+        if valid and length_mm > best_length + 2*spacing + TOLERANCE:
+            best = copy.deepcopy(route)
+            best["branches"], best["join"] = trial, join
+            best["turns_by_branch"] = {side: trial[side]["turns_used"] for side in trial}
+            best["turns_used"] = sum(best["turns_by_branch"].values())
+            best["stop_reason"] = {side: trial[side]["stop_reason"] for side in trial}
+            for event in log:
+                event = dict(event)
+                event.pop("step", None)
+                _record(best["journal"], event.pop("action"), **event)
+            _record(best["journal"], "entry_bypass_completed", follower=second,
+                    trim_mm=step*spacing, resume=list(resume), length_mm=length_mm)
+            best["abandoned_segments"] = _abandoned_segments(best["journal"], trial, join, minimum)
+            best_length = length_mm
+            break
+    return best
+
+
 def build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
@@ -2675,7 +2778,55 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
         except ValueError as error:
             failure = error.args[0] if error.args else "invalid_entry"
     if failure is None:
-        return route
+        # A valid join alone does not prove coverage. Compare independent
+        # completions after entry trimming and pair simplification. Require
+        # at least one full paired advance (one spacing on each branch).
+        checked = start_at_calculated_entries(copy.deepcopy(route))
+        best_length = route_length_mm(checked["branches"]) + (
+            _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
+        def boundary_coverage(candidate):
+            coverage = []
+            for a, b in zip(candidate["contour"], candidate["contour"][1:] + candidate["contour"][:1]):
+                axis = 0 if abs(b[0]-a[0]) > TOLERANCE else 1
+                low, high = sorted((a[axis], b[axis]))
+                intervals = []
+                for branch in candidate["branches"].values():
+                    for c, d in zip(branch["vertices"], branch["vertices"][1:]):
+                        if (abs(c[1-axis]-d[1-axis]) > TOLERANCE or
+                                abs(c[1-axis]-a[1-axis]) > spacing_mm/2.0 + TOLERANCE):
+                            continue
+                        start, end = max(low, min(c[axis], d[axis])), min(high, max(c[axis], d[axis]))
+                        if end > start:
+                            intervals.append((start, end))
+                total, end = 0.0, low
+                for start, stop in sorted(intervals):
+                    total += max(0.0, stop-max(end, start))
+                    end = max(end, stop)
+                coverage.append(total)
+            return coverage
+        required_coverage = boundary_coverage(checked)
+        for guided, rebind in ((True, True), (False, False)):
+            candidate = _build_vector_route_once(*(arguments + (guided, rebind)))
+            if not candidate["join"]["connected"]:
+                continue
+            try:
+                checked = start_at_calculated_entries(copy.deepcopy(candidate))
+            except ValueError:
+                continue
+            valid, reason = _valid_join(checked["branches"]["right"]["vertices"],
+                checked["branches"]["left"]["vertices"], checked["join"].get("bridge"),
+                checked["contour"], spacing_mm, min_segment_mm)
+            length = route_length_mm(checked["branches"]) + (
+                _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
+            preserves_boundary = all(actual + TOLERANCE >= required
+                for actual, required in zip(boundary_coverage(checked), required_coverage))
+            if valid and preserves_boundary and length > best_length + 2.0 * spacing_mm + TOLERANCE:
+                _record(candidate["journal"], "coverage_completion_selected",
+                        policy="inner_support" if guided else "heading_priority",
+                        previous_length_mm=best_length, length_mm=length)
+                route, best_length = candidate, length
+        return _complete_entry_bypass(route, entry_direction, spacing_mm,
+            offset_mm, min_segment_mm, max_turns, max_rounds, clockwise)
     established = _build_vector_route_once(*(arguments + (False,)))
     if established["join"]["connected"]:
         try:
