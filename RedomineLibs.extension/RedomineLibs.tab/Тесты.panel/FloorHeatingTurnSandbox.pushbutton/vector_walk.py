@@ -2670,6 +2670,171 @@ def _build_vector_route_once(polygon, right_start, left_start,
             "validated": False}
 
 
+def _boundary_coverage(candidate, spacing_mm):
+    coverage = []
+    for a, b in zip(candidate["contour"], candidate["contour"][1:] + candidate["contour"][:1]):
+        axis = 0 if abs(b[0]-a[0]) > TOLERANCE else 1
+        low, high = sorted((a[axis], b[axis]))
+        intervals = []
+        for branch in candidate["branches"].values():
+            for c, d in zip(branch["vertices"], branch["vertices"][1:]):
+                if (abs(c[1-axis]-d[1-axis]) > TOLERANCE or
+                        abs(c[1-axis]-a[1-axis]) > spacing_mm/2.0 + TOLERANCE):
+                    continue
+                start, end = max(low, min(c[axis], d[axis])), min(high, max(c[axis], d[axis]))
+                if end > start:
+                    intervals.append((start, end))
+        total, end = 0.0, low
+        for start, stop in sorted(intervals):
+            total += max(0.0, stop-max(end, start))
+            end = max(end, stop)
+        coverage.append(total)
+    return coverage
+
+
+def _complete_inward_bypass(route, spacing, offset, minimum,
+                            max_turns, max_rounds, clockwise):
+    """Try paired inward detours before an outward turn at an obstacle.
+
+    A follower must turn one spacing before the leader, otherwise its
+    transverse leg crosses the leader's resumed pass. Search lengths from
+    geometry on the spacing grid, then validate the complete pair.
+    """
+    first, second = ("left", "right") if clockwise else ("right", "left")
+    original = copy.deepcopy(route["branches"])
+    # Reopen simplified bypasses only in the search copy. Keep the accepted
+    # route unless a complete, clear continuation improves it.
+    for event in reversed(route["journal"]):
+        if event["action"] != "pair_corner_simplified":
+            continue
+        vertices = original[event["branch"]]["vertices"]
+        new_path = event["new_path"]
+        for start in range(len(vertices)-len(new_path)+1):
+            if all(_distance(a, b) <= TOLERANCE for a, b in
+                   zip(vertices[start:start+len(new_path)], new_path)):
+                vertices[start:start+len(new_path)] = [tuple(p) for p in event["old_path"]]
+                break
+    best = route
+    best_length = route_length_mm(route["branches"])
+    budget = [max_rounds]
+    fv, sv = original[first]["vertices"], original[second]["vertices"]
+    for index in range(2, len(fv)-1):
+        a, b, c = fv[index-1:index+2]
+        length = _distance(a, b)
+        if length <= minimum:
+            continue
+        heading = tuple((b[k]-a[k])/length for k in (0, 1))
+        inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
+        outgoing_length = _distance(b, c)
+        if outgoing_length <= minimum:
+            continue
+        outgoing = tuple((c[k]-b[k])/outgoing_length for k in (0, 1))
+        # Only revisit outward corners; ordinary inner turns stay intact.
+        if _distance(outgoing, (-inward[0], -inward[1])) > TOLERANCE:
+            continue
+        # At least three clockwise quarter turns distinguish the return
+        # after the outer sweep from a first visit to a boundary protrusion.
+        winding = 0.0
+        for aa, bb, cc in zip(fv[:index], fv[1:index+1], fv[2:index+1]):
+            ux, uy = bb[0]-aa[0], bb[1]-aa[1]
+            vx, vy = cc[0]-bb[0], cc[1]-bb[1]
+            winding += math.atan2(ux*vy-uy*vx, ux*vx+uy*vy)
+        if winding * (-1 if clockwise else 1) < 1.5*math.pi - TOLERANCE:
+            continue
+        for other_index in range(2, len(sv)):
+            u, v = sv[other_index-1:other_index+1]
+            other_length = _distance(u, v)
+            if other_length <= minimum:
+                continue
+            other_heading = tuple((v[k]-u[k])/other_length for k in (0, 1))
+            lateral = sum((u[k]-b[k])*inward[k] for k in (0, 1))
+            if (_distance(heading, other_heading) > TOLERANCE or
+                    abs(lateral-spacing) > TOLERANCE):
+                continue
+            follower_end = tuple(b[k]-heading[k]*spacing+inward[k]*spacing for k in (0, 1))
+            if not _on_segment(follower_end, u, v):
+                continue
+            prefix = copy.deepcopy(original)
+            prefix[first]["vertices"] = list(fv[:index+1])
+            prefix[second]["vertices"] = list(sv[:other_index]) + [follower_end]
+            for branch in prefix.values():
+                branch["segments"] = list(zip(branch["vertices"], branch["vertices"][1:]))
+            forward = probe_ray(b, heading, route["contour"],
+                prefix[first]["segments"], _obstacles(prefix[second], "other_branch"), spacing)
+            # Only bypass a pipe within the width of a paired lane;
+            # an unobstructed run must continue to its own contour corner.
+            if (forward["blocker"] == "boundary" or
+                    forward["available_mm"] > 2*spacing + TOLERANCE):
+                continue
+            available = min(probe_ray(prefix[side]["vertices"][-1], inward,
+                route["contour"], prefix[side]["segments"],
+                _obstacles(prefix[second if side == first else first], "other_branch"),
+                spacing)["available_mm"] for side in (first, second))
+            for step in range(1, int((available+TOLERANCE)/spacing)+1):
+                if budget[0] <= 0:
+                    return best
+                budget[0] -= 1
+                trial = copy.deepcopy(prefix)
+                for side in (first, second):
+                    branch = trial[side]
+                    start = branch["vertices"][-1]
+                    branch["vertices"].append(_advance(start, inward, step*spacing))
+                    branch["segments"] = list(zip(branch["vertices"], branch["vertices"][1:]))
+                    branch["heading"] = inward
+                    branch["turns_used"] = sum(1 for aa, bb in zip(
+                        branch["segments"], branch["segments"][1:])
+                        if abs((aa[1][0]-aa[0][0])*(bb[1][1]-bb[0][1])-
+                               (aa[1][1]-aa[0][1])*(bb[1][0]-bb[0][0])) > TOLERANCE)
+                    choice = next(name for name, direction in _directions(inward, clockwise)
+                                  if _distance(direction, heading) <= TOLERANCE)
+                    branch.update(stop_reason=None, pending_turn=choice,
+                        recovery_only_direction=choice, contour_guided=True,
+                        contour_anchor=_contour_projection(branch["vertices"][-1],
+                            route["contour"], clockwise),
+                        returning_from_protrusion=None, rejected_primary_obstacle=None)
+                if any(branch["turns_used"] >= max_turns for branch in trial.values()):
+                    continue
+                # Prefix clearance matters too, before any continuation runs.
+                if not _valid_join(trial["right"]["vertices"],
+                    trial["left"]["vertices"], None, route["contour"], spacing, minimum)[0]:
+                    continue
+                journal = []
+                for side in (first, second):
+                    start, end = trial[side]["segments"][-1]
+                    _record(journal, "inward_bypass_segment", branch=side,
+                            start=list(start), end=list(end), length_mm=step*spacing)
+                join, details = _continue_after_recovery(trial, first, second,
+                    route["contour"], spacing, offset, minimum, max_turns,
+                    max_rounds, clockwise, 1, journal, search_alternatives=False,
+                    search_budget=budget)
+                if not join.get("connected"):
+                    continue
+                valid, reason = _valid_join(trial["right"]["vertices"],
+                    trial["left"]["vertices"], join.get("bridge"),
+                    route["contour"], spacing, minimum)
+                length_mm = route_length_mm(trial)
+                preserves_boundary = all(actual + TOLERANCE >= required
+                    for actual, required in zip(_boundary_coverage(
+                        {"contour": route["contour"], "branches": trial}, spacing),
+                        _boundary_coverage({"contour": route["contour"], "branches": prefix}, spacing)))
+                if valid and preserves_boundary and length_mm > best_length + 2*spacing + TOLERANCE:
+                    best = copy.deepcopy(route)
+                    best["branches"], best["join"] = trial, join
+                    best["turns_by_branch"] = {side: trial[side]["turns_used"] for side in trial}
+                    best["turns_used"] = sum(best["turns_by_branch"].values())
+                    best["stop_reason"] = {side: trial[side]["stop_reason"] for side in trial}
+                    for event in journal:
+                        event = dict(event)
+                        event.pop("step", None)
+                        _record(best["journal"], event.pop("action"), **event)
+                    _record(best["journal"], "inward_bypass_completed",
+                            first_segment=index-1, second_segment=other_index-1,
+                            depth_mm=step*spacing, length_mm=length_mm)
+                    best["abandoned_segments"] = _abandoned_segments(best["journal"], trial, join, minimum)
+                    best_length = length_mm
+    return best
+
+
 def _complete_entry_bypass(route, normal, spacing, offset, minimum,
                             max_turns, max_rounds, clockwise):
     """Resume the incoming direction after a short paired entry bypass.
@@ -2784,27 +2949,7 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
         checked = start_at_calculated_entries(copy.deepcopy(route))
         best_length = route_length_mm(checked["branches"]) + (
             _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
-        def boundary_coverage(candidate):
-            coverage = []
-            for a, b in zip(candidate["contour"], candidate["contour"][1:] + candidate["contour"][:1]):
-                axis = 0 if abs(b[0]-a[0]) > TOLERANCE else 1
-                low, high = sorted((a[axis], b[axis]))
-                intervals = []
-                for branch in candidate["branches"].values():
-                    for c, d in zip(branch["vertices"], branch["vertices"][1:]):
-                        if (abs(c[1-axis]-d[1-axis]) > TOLERANCE or
-                                abs(c[1-axis]-a[1-axis]) > spacing_mm/2.0 + TOLERANCE):
-                            continue
-                        start, end = max(low, min(c[axis], d[axis])), min(high, max(c[axis], d[axis]))
-                        if end > start:
-                            intervals.append((start, end))
-                total, end = 0.0, low
-                for start, stop in sorted(intervals):
-                    total += max(0.0, stop-max(end, start))
-                    end = max(end, stop)
-                coverage.append(total)
-            return coverage
-        required_coverage = boundary_coverage(checked)
+        required_coverage = _boundary_coverage(checked, spacing_mm)
         for guided, rebind in ((True, True), (False, False)):
             candidate = _build_vector_route_once(*(arguments + (guided, rebind)))
             if not candidate["join"]["connected"]:
@@ -2816,15 +2961,34 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
             valid, reason = _valid_join(checked["branches"]["right"]["vertices"],
                 checked["branches"]["left"]["vertices"], checked["join"].get("bridge"),
                 checked["contour"], spacing_mm, min_segment_mm)
+            if contour_guided and not guided:
+                # A heading-only completion must retain the paired order.
+                # Extra length from mismatched turns is not spiral coverage.
+                paired = True
+                lv = checked["branches"]["left"]["vertices"]
+                rv = checked["branches"]["right"]["vertices"]
+                for index in range(1, min(len(lv), len(rv))-2):
+                    a, b = lv[index:index+2]
+                    c, d = rv[index:index+2]
+                    u = tuple((b[k]-a[k])/_distance(a, b) for k in (0, 1))
+                    v = tuple((d[k]-c[k])/_distance(c, d) for k in (0, 1))
+                    if (_distance(u, v) > TOLERANCE or
+                            abs(_segment_clearance((a, b), (c, d))-spacing_mm) > TOLERANCE):
+                        paired = False
+                        break
+                if not paired:
+                    continue
             length = route_length_mm(checked["branches"]) + (
                 _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
             preserves_boundary = all(actual + TOLERANCE >= required
-                for actual, required in zip(boundary_coverage(checked), required_coverage))
+                for actual, required in zip(_boundary_coverage(checked, spacing_mm), required_coverage))
             if valid and preserves_boundary and length > best_length + 2.0 * spacing_mm + TOLERANCE:
                 _record(candidate["journal"], "coverage_completion_selected",
                         policy="inner_support" if guided else "heading_priority",
                         previous_length_mm=best_length, length_mm=length)
                 route, best_length = candidate, length
+        route = _complete_inward_bypass(route, spacing_mm, offset_mm,
+            min_segment_mm, max_turns, max_rounds, clockwise)
         return _complete_entry_bypass(route, entry_direction, spacing_mm,
             offset_mm, min_segment_mm, max_turns, max_rounds, clockwise)
     established = _build_vector_route_once(*(arguments + (False,)))
