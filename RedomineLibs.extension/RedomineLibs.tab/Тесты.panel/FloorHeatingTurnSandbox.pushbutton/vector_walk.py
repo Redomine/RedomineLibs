@@ -5,6 +5,8 @@ from __future__ import division
 import math
 import copy
 
+from build_progress import checkpoint
+
 from floor_heating_geometry import (TOLERANCE, _advance, _correct_entry,
                                   _distance, _inside, _on_segment, _offset_polygon,
                                   _ray_boundary_distance)
@@ -12,6 +14,7 @@ from floor_heating_pair import _append_branch_segment, _entry_at_depth
 
 
 def _record(journal, action, **details):
+    checkpoint()
     event = {"step": len(journal) + 1, "action": action}
     event.update(details)
     journal.append(event)
@@ -1291,6 +1294,7 @@ def _valid_join(right, left, bridge, contour, spacing, min_segment):
             return False, "bridge_outside_contour"
         segments.append(("bridge", 0, bridge))
     for index, (side_a, number_a, segment_a) in enumerate(segments):
+        checkpoint()
         for side_b, number_b, segment_b in segments[index + 1:]:
             adjacent = (side_a == side_b and
                         abs(number_a - number_b) == 1)

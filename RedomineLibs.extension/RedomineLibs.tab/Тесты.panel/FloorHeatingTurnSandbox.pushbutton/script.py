@@ -29,6 +29,7 @@ SETTINGS_XAML = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
 COMMAND_DIR = os.path.dirname(os.path.abspath(__file__))
 if COMMAND_DIR not in sys.path:
     sys.path.insert(0, COMMAND_DIR)
+from build_progress import BuildProgress, BuildCancelled, checkpoint, report_stage
 from floor_heating_pair import classify_open_ends
 from vector_walk import (arrowhead_segments, build_vector_route,
                          calculate_start_points, limit_route_length,
@@ -210,6 +211,7 @@ def _write_failure_log(run_id, region_id, settings, error):
 def _draw(document, view, branches, join, abandoned_segments,
           abandoned_events, first_side, spacing_mm, min_segment_mm,
           show_abandoned):
+    checkpoint()
     ids = {"right": [], "left": [], "bridge": [],
            "abandoned": [], "abandoned_arrows": []}
     second_side = "left" if first_side == "right" else "right"
@@ -230,6 +232,7 @@ def _draw(document, view, branches, join, abandoned_segments,
         if show_abandoned:
             for (first, second), event in zip(abandoned_segments,
                                               abandoned_events):
+                checkpoint()
                 test_override = overrides[event["branch"]][1]
                 line = DB.Line.CreateBound(_world(first, view), _world(second, view))
                 detail = document.Create.NewDetailCurve(view, line)
@@ -247,6 +250,7 @@ def _draw(document, view, branches, join, abandoned_segments,
         for side in ("right", "left"):
             vertices = branches[side]["vertices"]
             for first, second in zip(vertices, vertices[1:]):
+                checkpoint()
                 if abs(first[0] - second[0]) <= 0.001 and abs(first[1] - second[1]) <= 0.001:
                     continue
                 line = DB.Line.CreateBound(_world(first, view), _world(second, view))
@@ -259,6 +263,7 @@ def _draw(document, view, branches, join, abandoned_segments,
             detail = document.Create.NewDetailCurve(view, line)
             view.SetElementOverrides(detail.Id, overrides[first_side][0])
             ids["bridge"].append(detail.Id.GetIdValue())
+        checkpoint()
         if transaction.Commit() != DB.TransactionStatus.Committed:
             raise RuntimeError("Транзакция построения не завершилась")
     except Exception:
@@ -328,10 +333,12 @@ def _build_region(document, view, region, selection_method, settings, run_id):
             "route": route, "line_ids": {"right": [], "left": [],
                                            "bridge": [], "abandoned": [],
                                            "abandoned_arrows": []}}
+    checkpoint()
     if settings["save_journal"]:
         _write_log(data)
     test_events = [event for event in route["journal"] if
                    event["action"] == "abandoned_segment"]
+    report_stage(u"Отрисовка")
     data["line_ids"] = _draw(document, view, route["branches"],
                              route["join"], route["abandoned_segments"],
                              test_events, first_side, settings["spacing_mm"],
@@ -361,22 +368,31 @@ def main():
     successes = []
     failures = []
     limited = []
-    for region in regions:
-        identifier = region.Id.GetIdValue()
-        run_id = str(uuid.uuid4())
-        try:
-            data = _build_region(document, view, region, selection_method,
-                                 settings, run_id)
-            successes.append(identifier)
-            if data["route"]["length_limit_hit"]:
-                limited.append(identifier)
-        except Exception as error:
-            failures.append((identifier, unicode(error)))
-            if settings["save_journal"]:
-                _write_failure_log(run_id, identifier, settings, error)
-    if len(regions) > 1 or failures or limited:
+    cancelled = False
+    with BuildProgress(len(regions)) as progress:
+        for index, region in enumerate(regions):
+            identifier = region.Id.GetIdValue()
+            run_id = str(uuid.uuid4())
+            try:
+                progress.region(u"Область {0}/{1}: {2}".format(index+1, len(regions), identifier))
+                data = _build_region(document, view, region, selection_method,
+                                     settings, run_id)
+                successes.append(identifier)
+                if data["route"]["length_limit_hit"]:
+                    limited.append(identifier)
+            except BuildCancelled:
+                cancelled = True
+                break
+            except Exception as error:
+                failures.append((identifier, unicode(error)))
+                if settings["save_journal"]:
+                    _write_failure_log(run_id, identifier, settings, error)
+            progress.finish_region()
+    if len(regions) > 1 or failures or limited or cancelled:
         lines = [u"Областей: {0}; построено: {1}; ошибок: {2}.".format(
             len(regions), len(successes), len(failures))]
+        if cancelled:
+            lines.append(u"Построение отменено. Текущая область не построена; готовые области сохранены.")
         if limited:
             lines.append(u"Предел длины достигнут: {0}.".format(
                 u", ".join(str(value) for value in limited)))

@@ -2,6 +2,8 @@
 """Geometric decisions for the second pipe of a single serpentine."""
 from __future__ import division
 
+from build_progress import checkpoint
+
 from floor_heating_geometry import (TOLERANCE, _correct_entry, _distance, _inside,
                                     _offset_polygon, _ray_boundary_distance)
 from floor_heating_pair import _entry_at_depth
@@ -34,6 +36,7 @@ def _first_pipe(polygon, contour, start, normal, sweep, spacing,
         vertices.append(entry)
     direction = sweep
     for unused in range(max_turns + 2):
+        checkpoint()
         point = vertices[-1]
         travel = _ray_boundary_distance(point, direction, contour)
         if direction[0] != sweep[0]:
@@ -86,6 +89,7 @@ def build_single_serpentine_route(polygon, right_start, left_start,
         spacing_mm, offset_mm, second_entry[0], max_turns, min_segment_mm)
     # Candidate joins are tried from the longest complete first-pipe prefix.
     for length in range(len(first_vertices), 1, -1):
+        checkpoint()
         first = first_vertices[:length]
         target = first[-1]
         if (target[1] - second_entry[1]) * entry_direction[1] <= min_segment_mm:
