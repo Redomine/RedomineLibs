@@ -2924,7 +2924,116 @@ def _complete_entry_bypass(route, normal, spacing, offset, minimum,
     return best
 
 
+def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
+    """Replace a premature, one-sided terminal jog with paired inner turns."""
+    if not route["join"].get("connected"):
+        return route
+    branches = route["branches"]
+    bridge = route["join"].get("bridge")
+    # A one-spacing cap already closes a regular paired pass.
+    if bridge is not None and abs(_distance(*bridge)-spacing) <= TOLERANCE:
+        return route
+    if bridge is None:
+        for side, other in (("left", "right"), ("right", "left")):
+            v, u = branches[side]["vertices"], branches[other]["vertices"]
+            if (len(v) >= 3 and _distance(v[-1], u[-1]) <= TOLERANCE and
+                    abs(_distance(v[-2], v[-1])-spacing) <= TOLERANCE and
+                    abs(_segment_clearance((v[-3], v[-2]), (u[-2], u[-1]))-spacing) <= TOLERANCE):
+                return route
+    first, second = ("left", "right") if clockwise else ("right", "left")
+    fv, sv = branches[first]["vertices"], branches[second]["vertices"]
+    # Search the most recent paired pass first. Earlier passes remain intact.
+    for i in range(len(fv)-2, 1, -1):
+        a, b = fv[i-1:i+1]
+        length = _distance(a, b)
+        if length <= minimum:
+            continue
+        heading = tuple((b[k]-a[k])/length for k in (0, 1))
+        inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
+        for j in range(len(sv)-2, 1, -1):
+            c, d = sv[j-1:j+1]
+            other_length = _distance(c, d)
+            if other_length <= minimum:
+                continue
+            other_heading = tuple((d[k]-c[k])/other_length for k in (0, 1))
+            if (_distance(heading, other_heading) > TOLERANCE or
+                    abs(sum((c[k]-a[k])*inward[k] for k in (0, 1))-spacing) > TOLERANCE or
+                    abs(_segment_clearance((a, b), (c, d))-spacing) > TOLERANCE):
+                continue
+            trial = copy.deepcopy(branches)
+            trial[first]["vertices"] = list(fv[:i])
+            trial[second]["vertices"] = list(sv[:j])
+            best = None
+            best_length = -1
+            log = []
+            for turn in range(max_turns + 1):
+                for branch in trial.values():
+                    vs = branch["vertices"]
+                    branch["segments"] = list(zip(vs, vs[1:]))
+                starts = {side: trial[side]["vertices"][-1] for side in (first, second)}
+                delta = sum((starts[second][k]-starts[first][k])*heading[k] for k in (0, 1))
+                limits = {side: probe_ray(starts[side], heading, route["contour"],
+                    trial[side]["segments"], _obstacles(trial[second if side == first else first],
+                    "other_branch"), spacing)["available_mm"] for side in (first, second)}
+                distance = min(limits[first], limits[second]+spacing+delta)
+                distances = {first: distance, second: distance-spacing-delta}
+                if min(distances.values()) < max(spacing, minimum)-TOLERANCE:
+                    break
+                for side in (first, second):
+                    trial[side]["vertices"].append(_advance(starts[side], heading, distances[side]))
+                if not _valid_join(trial["right"]["vertices"], trial["left"]["vertices"],
+                                   None, route["contour"], spacing, minimum)[0]:
+                    break
+                closed = copy.deepcopy(trial)
+                join = _finish_route(closed, route["contour"], spacing, minimum, log, first)
+                if join.get("connected"):
+                    for branch in closed.values():
+                        vs = branch["vertices"]
+                        branch["segments"] = list(zip(vs, vs[1:]))
+                        branch["turns_used"] = sum(1 for aa, bb, cc in zip(vs, vs[1:], vs[2:])
+                            if abs((bb[0]-aa[0])*(cc[1]-bb[1])-(bb[1]-aa[1])*(cc[0]-bb[0])) > TOLERANCE)
+                        branch["heading"] = heading
+                        branch["stop_reason"] = "paired_terminal_cap"
+                    total = route_length_mm(closed) + (_distance(*join["bridge"]) if join.get("bridge") else 0)
+                    if max(branch["turns_used"] for branch in closed.values()) <= max_turns and total > best_length:
+                        best, best_length = (closed, join, turn), total
+                heading = inward
+                inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
+            if best is not None:
+                closed, join, turns = best
+                if any(actual + TOLERANCE < required for actual, required in zip(
+                        _boundary_coverage({"contour": route["contour"], "branches": closed}, spacing),
+                        _boundary_coverage(route, spacing))):
+                    continue
+                result = copy.deepcopy(route)
+                result["branches"], result["join"], turns = best
+                result["turns_by_branch"] = {side: result["branches"][side]["turns_used"] for side in branches}
+                result["turns_used"] = sum(result["turns_by_branch"].values())
+                result["stop_reason"] = {side: "paired_terminal_cap" for side in branches}
+                if "length_mm" in result:
+                    result["length_mm"] = route_length_mm(result["branches"])
+                _record(result["journal"], "terminal_pair_completed", first_segment=i-1,
+                        second_segment=j-1, paired_turns=turns, length_mm=best_length,
+                        old_tail={first: fv[i-1:], second: sv[j-1:]},
+                        new_tail={first: closed[first]["vertices"][i-1:],
+                                  second: closed[second]["vertices"][j-1:]})
+                result["abandoned_segments"] = _abandoned_segments(result["journal"],
+                    result["branches"], result["join"], minimum)
+                return result
+    return route
+
+
 def build_vector_route(polygon, right_start, left_start, entry_direction,
+                       max_turns, offset_mm=200.0, spacing_mm=150.0,
+                       min_segment_mm=1.0, max_rounds=500,
+                       clockwise=False, contour_guided=False):
+    route = _build_vector_route(polygon, right_start, left_start, entry_direction,
+        max_turns, offset_mm, spacing_mm, min_segment_mm, max_rounds,
+        clockwise, contour_guided)
+    return _complete_terminal_pair(route, spacing_mm, min_segment_mm, max_turns, clockwise)
+
+
+def _build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
                        clockwise=False, contour_guided=False):
