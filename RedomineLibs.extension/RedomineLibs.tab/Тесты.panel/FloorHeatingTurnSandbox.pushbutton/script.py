@@ -4,6 +4,7 @@ from __future__ import print_function
 import io
 import json
 import math
+import time
 import os
 import sys
 import uuid
@@ -161,12 +162,13 @@ def _polygon(region, view):
     return vertices
 
 
-def _free_ends(document, view, polygon):
+def _free_end_candidates(document, view):
     result = []
     collector = (DB.FilteredElementCollector(document)
                  .OfCategory(DB.BuiltInCategory.OST_PipeCurves)
                  .WhereElementIsNotElementType())
     for pipe in collector:
+        checkpoint()
         manager = getattr(pipe, "ConnectorManager", None)
         if manager is None:
             continue
@@ -176,15 +178,29 @@ def _free_ends(document, view, polygon):
             if connector.ConnectorType != DB.ConnectorType.End or connector.IsConnected:
                 continue
             point = _point(connector.Origin, view)
-            if _inside(point, polygon):
-                if len(connectors) != 2:
-                    raise ValueError("У трубы {0} ожидается два концевых соединителя".format(
-                        pipe.Id.GetIdValue()))
-                other = connectors[0] if connectors[1] == connector else connectors[1]
-                other_point = _point(other.Origin, view)
-                vector = (point[0] - other_point[0], point[1] - other_point[1])
-                result.append({"pipe_id": pipe.Id.GetIdValue(), "point": point,
-                               "direction_vector": vector})
+            result.append((pipe, connectors, connector, point))
+    return result
+
+
+def _free_ends(document, view, polygon, cache=None):
+    # Scoped to one command: detail curves do not change pipe connections.
+    if cache is None:
+        candidates = _free_end_candidates(document, view)
+    else:
+        if "free_ends" not in cache:
+            cache["free_ends"] = _free_end_candidates(document, view)
+        candidates = cache["free_ends"]
+    result = []
+    for pipe, connectors, connector, point in candidates:
+        if _inside(point, polygon):
+            if len(connectors) != 2:
+                raise ValueError("У трубы {0} ожидается два концевых соединителя".format(
+                    pipe.Id.GetIdValue()))
+            other = connectors[0] if connectors[1] == connector else connectors[1]
+            other_point = _point(other.Origin, view)
+            vector = (point[0] - other_point[0], point[1] - other_point[1])
+            result.append({"pipe_id": pipe.Id.GetIdValue(), "point": point,
+                           "direction_vector": vector})
     return result
 
 
@@ -273,11 +289,13 @@ def _draw(document, view, branches, join, abandoned_segments,
     return ids
 
 
-def _build_region(document, view, region, selection_method, settings, run_id):
+def _build_region(document, view, region, selection_method, settings, run_id,
+                  input_cache=None):
+    started = time.time()
     clockwise = settings["clockwise"]
     limit = settings["max_turns"]
     polygon = _polygon(region, view)
-    ends = _free_ends(document, view, polygon)
+    ends = _free_ends(document, view, polygon, input_cache)
     if len(ends) != 2:
         raise ValueError("В области требуется ровно два свободных конца труб; найдено: {0}".format(len(ends)))
     right_end, left_end, direction, separation = classify_open_ends(ends)
@@ -285,6 +303,7 @@ def _build_region(document, view, region, selection_method, settings, run_id):
         polygon, right_end["point"], left_end["point"], direction,
         settings["offset_mm"], settings["spacing_mm"])
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
+    prepared = time.time()
     if settings["algorithm"] == "single_serpentine":
         route = build_single_serpentine_route(
             polygon, right_start, left_start, direction, limit,
@@ -315,6 +334,7 @@ def _build_region(document, view, region, selection_method, settings, run_id):
             route["stop_reason"]["right"] == "sweep_blocked" and
             route["turns_by_branch"]["right"] == 0):
         raise ValueError(u"От стартовой позиции нет места для первого прохода змейки")
+    calculated = time.time()
     data = {"run_id": run_id, "document_title": document.Title,
             "document_path": document.PathName, "view_id": view.Id.GetIdValue(),
             "view_name": view.Name, "region_id": region.Id.GetIdValue(),
@@ -333,16 +353,20 @@ def _build_region(document, view, region, selection_method, settings, run_id):
             "route": route, "line_ids": {"right": [], "left": [],
                                            "bridge": [], "abandoned": [],
                                            "abandoned_arrows": []}}
+    data["timings_seconds"] = {"prepare": prepared - started,
+                               "route": calculated - prepared}
     checkpoint()
     if settings["save_journal"]:
         _write_log(data)
     test_events = [event for event in route["journal"] if
                    event["action"] == "abandoned_segment"]
     report_stage(u"Отрисовка")
+    draw_started = time.time()
     data["line_ids"] = _draw(document, view, route["branches"],
                              route["join"], route["abandoned_segments"],
                              test_events, first_side, settings["spacing_mm"],
                              minimum_curve_mm, settings["show_abandoned"])
+    data["timings_seconds"]["draw"] = time.time() - draw_started
     for event, element_id, arrow_ids in zip(
             test_events, data["line_ids"]["abandoned"],
             data["line_ids"]["abandoned_arrows"]):
@@ -369,6 +393,7 @@ def main():
     failures = []
     limited = []
     cancelled = False
+    input_cache = {}
     with BuildProgress(len(regions)) as progress:
         for index, region in enumerate(regions):
             identifier = region.Id.GetIdValue()
@@ -376,7 +401,7 @@ def main():
             try:
                 progress.region(u"Область {0}/{1}: {2}".format(index+1, len(regions), identifier))
                 data = _build_region(document, view, region, selection_method,
-                                     settings, run_id)
+                                     settings, run_id, input_cache)
                 successes.append(identifier)
                 if data["route"]["length_limit_hit"]:
                     limited.append(identifier)
