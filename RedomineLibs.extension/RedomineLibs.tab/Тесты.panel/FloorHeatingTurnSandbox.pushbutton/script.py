@@ -22,8 +22,7 @@ MM_PER_FOOT = 304.8
 ROOT = os.path.join(os.environ["LOCALAPPDATA"], "RvtMcp",
                     "floor-heating-turn-sandbox")
 SETTINGS_SECTION = "FloorHeatingTurnSandbox"
-ROUTE_MODES = ("spiral_clockwise", "spiral_counterclockwise",
-               "spiral_contour_clockwise", "spiral_contour_counterclockwise",
+ROUTE_MODES = ("spiral_contour_clockwise", "spiral_contour_counterclockwise",
                "serpentine_left_to_right", "serpentine_right_to_left",
                "single_serpentine_left_to_right", "single_serpentine_right_to_left")
 SETTINGS_XAML = os.path.join(os.path.dirname(__file__), "SettingsWindow.xaml")
@@ -55,9 +54,9 @@ class SettingsWindow(forms.WPFWindow):
             if getattr(self.config, "algorithm", "spiral") == "serpentine":
                 saved_mode = "serpentine_left_to_right"
             else:
-                saved_mode = ("spiral_clockwise" if _saved_bool(
+                saved_mode = ("spiral_contour_clockwise" if _saved_bool(
                     getattr(self.config, "clockwise", False)) else
-                    "spiral_counterclockwise")
+                    "spiral_contour_counterclockwise")
         self.route_mode_combo.SelectedIndex = ROUTE_MODES.index(saved_mode)
         self.turns_text.Text = str(getattr(self.config, "max_turns", 100))
         self.max_length_text.Text = str(getattr(self.config, "max_length_m", 100))
@@ -94,9 +93,7 @@ class SettingsWindow(forms.WPFWindow):
                                   else "spiral"),
                     "offset_mm": offset,
                     "spacing_mm": spacing,
-                    "clockwise": mode in ("spiral_clockwise",
-                                          "spiral_contour_clockwise"),
-                    "contour_guided": mode.startswith("spiral_contour_"),
+                    "clockwise": mode == "spiral_contour_clockwise",
                     "show_abandoned": bool(self.blue_lines_check.IsChecked),
                     "save_journal": bool(self.save_journal_check.IsChecked)}
         for key, value in settings.items():
@@ -302,8 +299,7 @@ def _build_region(document, view, region, selection_method, settings, run_id):
                                    offset_mm=settings["offset_mm"],
                                    spacing_mm=settings["spacing_mm"],
                                    min_segment_mm=minimum_curve_mm,
-                                   clockwise=clockwise,
-                                   contour_guided=settings.get("contour_guided", False))
+                                   clockwise=clockwise)
     route = start_at_calculated_entries(route)
     route = limit_route_length(route, settings["max_length_m"] * 1000.0)
     first_side = ("left" if clockwise else "right") if settings[

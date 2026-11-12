@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Diagnostic paired walk with heading and contour-guided turn policies."""
+"""Contour-guided spiral and geometry shared by the serpentine routes."""
 from __future__ import division
 
 import math
@@ -2419,7 +2419,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
                              entry_direction, max_turns, offset_mm=200.0,
                              spacing_mm=150.0, min_segment_mm=1.0,
                              max_rounds=500, clockwise=False,
-                             contour_guided=False, rebind_inner_support=False):
+                             contour_guided=True, rebind_inner_support=False):
     """Alternate branches; try right, forward, and left in that order."""
     if isinstance(max_turns, bool) or int(max_turns) != max_turns or max_turns < 0:
         raise ValueError("max_turns_must_be_nonnegative_integer")
@@ -3019,23 +3019,21 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
 def build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
-                       clockwise=False, contour_guided=False):
+                       clockwise=False):
     route = _build_vector_route(polygon, right_start, left_start, entry_direction,
         max_turns, offset_mm, spacing_mm, min_segment_mm, max_rounds,
-        clockwise, contour_guided)
+        clockwise)
     return _complete_terminal_pair(route, spacing_mm, min_segment_mm, max_turns, clockwise)
 
 
 def _build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
-                       clockwise=False, contour_guided=False):
+                       clockwise=False):
     arguments = (polygon, right_start, left_start, entry_direction,
                  max_turns, offset_mm, spacing_mm, min_segment_mm,
                  max_rounds, clockwise)
-    route = _build_vector_route_once(*(arguments + (contour_guided,)))
-    if not contour_guided:
-        return route
+    route = _build_vector_route_once(*(arguments + (True,)))
     failure = None
     if not route["join"]["connected"]:
         failure = route["join"].get("reason", "no_join")
@@ -3063,7 +3061,7 @@ def _build_vector_route(polygon, right_start, left_start, entry_direction,
             valid, reason = _valid_join(checked["branches"]["right"]["vertices"],
                 checked["branches"]["left"]["vertices"], checked["join"].get("bridge"),
                 checked["contour"], spacing_mm, min_segment_mm)
-            if contour_guided and not guided:
+            if not guided:
                 # A heading-only completion must retain the paired order.
                 # Extra length from mismatched turns is not spiral coverage.
                 paired = True
