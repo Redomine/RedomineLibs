@@ -2930,27 +2930,20 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
         return route
     branches = route["branches"]
     bridge = route["join"].get("bridge")
-    # A one-spacing cap already closes a regular paired pass.
-    if bridge is not None and abs(_distance(*bridge)-spacing) <= TOLERANCE:
-        return route
-    if bridge is None:
-        for side, other in (("left", "right"), ("right", "left")):
-            v, u = branches[side]["vertices"], branches[other]["vertices"]
-            if (len(v) >= 3 and _distance(v[-1], u[-1]) <= TOLERANCE and
-                    abs(_distance(v[-2], v[-1])-spacing) <= TOLERANCE and
-                    abs(_segment_clearance((v[-3], v[-2]), (u[-2], u[-1]))-spacing) <= TOLERANCE):
-                return route
+    # A cap of one spacing proves pair clearance, not exhaustion of the
+    # inner room. Reopen it only if a complete paired advance adds length.
+    original_length = route_length_mm(branches) + (_distance(*bridge) if bridge else 0)
     first, second = ("left", "right") if clockwise else ("right", "left")
     fv, sv = branches[first]["vertices"], branches[second]["vertices"]
     # Search the most recent paired pass first. Earlier passes remain intact.
-    for i in range(len(fv)-2, 1, -1):
+    for i in range(len(fv)-1, 1, -1):
         a, b = fv[i-1:i+1]
         length = _distance(a, b)
         if length <= minimum:
             continue
         heading = tuple((b[k]-a[k])/length for k in (0, 1))
         inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
-        for j in range(len(sv)-2, 1, -1):
+        for j in range(len(sv)-1, 1, -1):
             c, d = sv[j-1:j+1]
             other_length = _distance(c, d)
             if other_length <= minimum:
@@ -2964,7 +2957,7 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
             trial[first]["vertices"] = list(fv[:i])
             trial[second]["vertices"] = list(sv[:j])
             best = None
-            best_length = -1
+            best_length = original_length + 2*spacing
             log = []
             for turn in range(max_turns + 1):
                 for branch in trial.values():
@@ -2995,7 +2988,7 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
                         branch["heading"] = heading
                         branch["stop_reason"] = "paired_terminal_cap"
                     total = route_length_mm(closed) + (_distance(*join["bridge"]) if join.get("bridge") else 0)
-                    if max(branch["turns_used"] for branch in closed.values()) <= max_turns and total > best_length:
+                    if max(branch["turns_used"] for branch in closed.values()) <= max_turns and total > best_length + TOLERANCE:
                         best, best_length = (closed, join, turn), total
                 heading = inward
                 inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
