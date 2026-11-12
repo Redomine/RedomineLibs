@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Scoped cooperative cancellation shared by all route builders."""
 import time
+from route_timing import timing_scope
 
 _callback = None
 _status = None
@@ -120,17 +121,18 @@ class BuildProgress(object):
         now = time.time()
         if not force and now-self.last_poll < 0.1:
             return
-        self.last_poll = now
-        elapsed = max(0, int(now - self.stage_started))
-        if elapsed != self.last_title_second:
-            self.last_title_second = elapsed
-            self.dialog.DisplayTitleFormat = (
-                self.region_title + u": " + self.stage_text +
-                u" | {0} мин {1:02d} с [{{0}}%]".format(elapsed // 60, elapsed % 60))
-        value = int(100.0 * (self.completed + self.stage_fraction) / self.total)
-        self.progress.Report(min(99, value))
-        if self.token.IsCancellationRequested:
-            raise BuildCancelled()
+        with timing_scope("progress_ui"):
+            self.last_poll = now
+            elapsed = max(0, int(now - self.stage_started))
+            if elapsed != self.last_title_second:
+                self.last_title_second = elapsed
+                self.dialog.DisplayTitleFormat = (
+                    self.region_title + u": " + self.stage_text +
+                    u" | {0} мин {1:02d} с [{{0}}%]".format(elapsed // 60, elapsed % 60))
+            value = int(100.0 * (self.completed + self.stage_fraction) / self.total)
+            self.progress.Report(min(99, value))
+            if self.token.IsCancellationRequested:
+                raise BuildCancelled()
 
     def region(self, text):
         self.region_title = text
