@@ -274,7 +274,33 @@ def is_params_exist(family_doc, family_name):
 
     return is_all_params_exist
 
+def trim_adsk_leading_spaces(family_doc):
+    manager = family_doc.FamilyManager
+    param_names = (u"ADSK_Наименование", u"ADSK_Наименование краткое", u"ADSK_Марка", u"ADSK_Код изделия")
+    params = [
+        param for param in manager.Parameters
+        if unicode(param.Definition.Name) in param_names
+        and param.StorageType == StorageType.String
+        and not param.IsReadOnly
+        and not param.IsDeterminedByFormula
+    ]
+    if not params:
+        return
+
+    original_type = manager.CurrentType
+    try:
+        for family_type in manager.Types:
+            manager.CurrentType = family_type
+            for param in params:
+                value = family_type.AsString(param)
+                if value and value.startswith(u" "):
+                    manager.Set(param, value.lstrip(u" "))
+    finally:
+        if original_type is not None:
+            manager.CurrentType = original_type
+
 def process_adsk_parameters(family_doc, family_name, settings):
+    trim_adsk_leading_spaces(family_doc)
     is_params_exist(family_doc, family_name)
 
     if settings["child_names"]:
