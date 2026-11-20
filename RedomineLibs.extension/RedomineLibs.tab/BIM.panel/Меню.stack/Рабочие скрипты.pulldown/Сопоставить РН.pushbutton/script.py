@@ -16,6 +16,8 @@ from dosymep_libs.bim4everyone import *
 from dosymep.Bim4Everyone.SharedParams import SharedParamsConfig
 from dosymep.Bim4Everyone import *
 
+from collections import namedtuple
+import re
 import sys
 import System
 from Autodesk.Revit.DB import *
@@ -25,6 +27,8 @@ from Autodesk.Revit.DB import ConnectorElement, MEPSystemClassification
 import os
 from pyrevit import revit, forms
 from System import Guid
+from System.Windows import TextWrapping, Thickness
+from System.Windows.Controls import ComboBox, TextBlock
 import shutil
 
 
@@ -33,37 +37,21 @@ app = uiapp.Application  # Application
 doc = __revit__.ActiveUIDocument.Document
 view = doc.ActiveView
 
-WORKSET_TABLE = \
-    {
-        "_KOORD": ["00_Связи_RVT_00_KOORD", "КООРД", "KOORD"],
-        "_AR": ["00_Связи_RVT_01_AP_(Номер корпуса)", "00_Связи_RVT_01_АР_(Номер корпуса)", "AP_(Номер корпуса)", "АР_(К", "АР_(Номер корпуса)", "АР_(Номер связи", "АР (Связи)", "RVT_01_АР_K", "RVT_01_АР_К", "00_Связи_АР_Жилая"],
-        "_AR_PRK": ["00_Связи_RVT_01_AP_(Паркинг)", "00_Связи_RVT_01_АР_(Паркинг)", "AP_(Паркинг)", "АР_(Паркинг)", "АР Паркинг (Связи)", "RVT_01_АР_PRK", "00_Связи_АР_Паркинг"],
-        "_EOM": ["00_Связи_RVT_05_ЭОМ_(Номер связи)", "00_Связи_RVT_05_3OM_(Номер связи)", "00_Связи_RVT_05_EOM_(Номер связи)", "3OM_(Номер связи)", "EOM_(Номер связи)", "ЭОМ_(Номер связи)", "ЭОМ (Связи)", "00_Связи_ЭОМ", "ЭОМ_Номер связи"],
-        "_SS": ["00_Связи_RVT_06_CC_(Номер связи)", "00_Связи_RVT_06_СС_(Номер связи)", "CC_(Номер связи)", "СС_(Номер связи)", "СС (Связи)", "00_Связи_СС", "СС_Номер связи"],
-        "_VK": ["00_Связи_RVT_04_ВК_(Номер связи)", "00_Связи_RVT_04_BK_(Номер связи)", "BK_(Номер связи)", "ВК_(Номер связи)", "ВК (Связи)", "ВК_Номер связи", "00_Связи_ВК"],
-        "_ITP": ["00_Связи_RVT_03_ОВ_ИТП_(Номер связи)", "ОВ_ИТП_(Номер связи)", "ИТП_(Номер связи)", "ИТП (Связи)"],
-        "_OV": ["00_Связи_RVT_03_OB_(Номер связи)", "00_Связи_RVT_03_ОВ_(Номер связи)", "OB_(Номер связи)", "ОВ_(Номер связи)", "ОВ (Связи)", "Связи_RVT_03_ОВ", "00_Связи_ОВ"],
-        "_KV": ["00_Связи_RVT_03_OB_(Номер связи)", "00_Связи_RVT_03_ОВ_(Номер связи)", "OB_(Номер связи)", "ОВ_(Номер связи)", "ОВ (Связи)", "Связи_RVT_03_ОВ", "00_Связи_ОВ"],
-        "_KR": ["00_Связи_RVT_02_KP_(Номер связи)", "00_Связи_RVT_02_КР_(Номер связи)", "KP_(Номер связи)", "КР_(Номер связи)", "КР (Связи)", "КР_(Номер"]
-    }
+LINK_WORKSET_MARKER = u"Связи"
+CHOICE_WINDOW_XAML = os.path.join(os.path.dirname(__file__), "WorksetChoiceWindow.xaml")
+WorksetChoice = namedtuple("WorksetChoice", "file_name sections candidates links")
+SECTION_ALIASES = {
+    u"КООРД": (u"KOORD", u"КООРД"),
+    u"АР": (u"AR", u"АР"),
+    u"КР": (u"KR", u"КР"),
+    u"ОВ": (u"OV", u"ОВ", u"KV", u"КВ"),
+    u"ИТП": (u"ITP", u"ИТП"),
+    u"ВК": (u"VK", u"ВК"),
+    u"СС": (u"SS", u"СС"),
+    u"ЭОМ": (u"EOM", u"ЭОМ"),
+}
+PARKING_ALIASES = (u"PRK", u"Паркинг")
 
-
-"""
-Бэкап исходной версии
-
-WORKSET_TABLE = \
-    {
-        "_KOORD":"_КООРД",
-        "_AR": "АР (Связи)",
-        "_AR_PRK": "АР Паркинг (Связи)",
-        "_EOM": "ЭОМ (Связи)",
-        "_SS": "СС (Связи)",
-        "_VK": "ВК (Связи)",
-        "_ITP": "ИТП (Связи)",
-        "_OV": "ОВ (Связи)"
-    }
-
-"""
 
 class EditorReport:
     def __init__(self, doc):
@@ -87,8 +75,9 @@ class EditorReport:
             self.status_report = "Вы владеете элементами, но ваш файл устарел. Выполните синхронизацию."
 
         name = self.__get_element_editor_name(element)
-        if name is not None and name not in self.edited_reports:
-            self.edited_reports.append(name)
+        if name is not None:
+            if name not in self.edited_reports:
+                self.edited_reports.append(name)
             return True
         return False
 
@@ -121,30 +110,32 @@ CONFUSABLE_CHARS = {
 }
 
 
-def normalize_workset_name(value):
-    if not isinstance(value, unicode):
-        value = unicode(value, "utf-8")
-    else:
-        value = unicode(value)
+def normalize_code(value):
+    value = value.upper()
     for source, replacement in CONFUSABLE_CHARS.items():
         value = value.replace(source, replacement)
-    return value.lower()
+    return value
 
 
-def get_workset(worksets, name_variants):
-    normalized_worksets = [(ws, normalize_workset_name(ws.Name)) for ws in worksets]
-    for name in name_variants:
-        normalized_name = normalize_workset_name(name)
-        for ws, normalized_ws_name in normalized_worksets:
-            if normalized_name in normalized_ws_name:
-                return ws
-    return None
+SECTION_BY_CODE = {
+    normalize_code(alias): section
+    for section, aliases in SECTION_ALIASES.items()
+    for alias in aliases
+}
+PARKING_CODES = {normalize_code(alias) for alias in PARKING_ALIASES}
+NAME_PART = re.compile(ur"[^\W_]+", re.UNICODE)
 
-def get_link_inst(link_insts, name):
-    for link in link_insts:
-        if name in link.Name:
-            return link
-    return None
+
+def get_sections(name):
+    codes = set(NAME_PART.findall(normalize_code(name)))
+    sections = {SECTION_BY_CODE[code] for code in codes if code in SECTION_BY_CODE}
+    if u"ИТП" in sections:
+        sections.discard(u"ОВ")
+    if u"АР" in sections and codes & PARKING_CODES:
+        sections.remove(u"АР")
+        sections.add(u"АР паркинг")
+    return tuple(sorted(sections))
+
 
 def set_link_ws(link, ws):
     param = link.get_Parameter(BuiltInParameter.ELEM_PARTITION_PARAM)
@@ -156,34 +147,150 @@ def set_link_ws(link, ws):
     if not type_param.IsReadOnly:
         type_param.Set(ws.Id.IntegerValue)
 
+
+class WorksetChoiceWindow(forms.WPFWindow):
+    def __init__(self, choices):
+        forms.WPFWindow.__init__(self, CHOICE_WINDOW_XAML)
+        self.rows = []
+        for choice in sorted(choices, key=lambda item: item.file_name.lower()):
+            label = TextBlock()
+            label.Text = choice.file_name
+            if len(choice.links) > 1:
+                label.Text += u" (экземпляров: {})".format(len(choice.links))
+            label.TextWrapping = TextWrapping.Wrap
+            label.Margin = Thickness(0, 0, 0, 4)
+            self.choice_rows.Children.Add(label)
+
+            combo = ComboBox()
+            combo.ItemsSource = [u"Пропустить"] + [ws.Name for ws in choice.candidates]
+            combo.SelectedIndex = 0
+            combo.Margin = Thickness(0, 0, 0, 12)
+            self.choice_rows.Children.Add(combo)
+            self.rows.append((choice, combo))
+
+        self.apply_button.Click += self.confirm
+
+    def confirm(self, sender, args):
+        self.DialogResult = True
+
+    def selections(self):
+        for choice, combo in self.rows:
+            index = combo.SelectedIndex
+            yield choice, choice.candidates[index - 1] if index > 0 else None
+
+
+def record_unmatched(unmatched, sections, link, workset_table):
+    link_workset = workset_table.GetWorkset(link.WorksetId)
+    workset_name = link_workset.Name if link_workset else u"не определён"
+    unmatched.setdefault(sections, []).append((link.Name, workset_name))
+
+
+def show_workset_report(link_count, matched_count, unmatched, link_worksets, worksets_by_section):
+    if not link_count:
+        print u"В текущей модели нет экземпляров связей Revit."
+        return
+
+    missing_count = 0
+    ambiguous_count = 0
+    for sections, links in unmatched.items():
+        if len(sections) == 1:
+            if worksets_by_section.get(sections[0]):
+                ambiguous_count += len(links)
+            else:
+                missing_count += len(links)
+
+    skipped_count = link_count - matched_count - missing_count - ambiguous_count
+    print (u"Экземпляров связей: {} | Рабочий набор подобран: {} | "
+           u"Рабочий набор не найден: {} | Несколько подходящих наборов: {} | Пропущено: {}").format(
+               link_count, matched_count, missing_count, ambiguous_count, skipped_count)
+
+    for sections, links in sorted(unmatched.items()):
+        if not sections:
+            reason = u"В имени файла не распознан раздел"
+        elif len(sections) > 1:
+            reason = u"В имени файла несколько разделов: {}".format(u", ".join(sections))
+        else:
+            section = sections[0]
+            candidates = worksets_by_section.get(section, [])
+            if candidates:
+                reason = u"{} — несколько подходящих наборов: {}".format(
+                    section, u"; ".join(sorted(ws.Name for ws in candidates)))
+            else:
+                reason = u"{} — нет подходящего рабочего набора с маркером «{}»".format(
+                    section, LINK_WORKSET_MARKER)
+
+        print u"{} (связей: {})".format(reason, len(links))
+        for link_name, workset_name in sorted(links):
+            print u"  • {} | Текущий РН: {}".format(link_name, workset_name)
+
+    if missing_count:
+        if link_worksets:
+            print u"Рабочие наборы с маркером «{}»: {}".format(
+                LINK_WORKSET_MARKER, u"; ".join(sorted(ws.Name for ws in link_worksets)))
+        else:
+            print u"В модели нет рабочих наборов с маркером «{}».".format(LINK_WORKSET_MARKER)
+
+
 def main():
     report = EditorReport(doc)
+    workset_table = doc.GetWorksetTable()
     collector = FilteredWorksetCollector(doc)
-    worksets = list(collector.OfKind(WorksetKind.UserWorkset))
+    marker = LINK_WORKSET_MARKER.upper()
+    link_worksets = [
+        ws for ws in collector.OfKind(WorksetKind.UserWorkset)
+        if marker in ws.Name.upper()
+    ]
+    worksets_by_section = {}
+    for ws in link_worksets:
+        sections = get_sections(ws.Name)
+        if len(sections) == 1:
+            worksets_by_section.setdefault(sections[0], []).append(ws)
 
+    unmatched = {}
+    assignments = []
+    choices_by_type = {}
     link_instances = FilteredElementCollector(doc) \
         .OfClass(RevitLinkInstance) \
         .ToElements()
 
-    with revit.Transaction("BIM: Сопоставление РН"):
-        for link in link_instances:
-            for link_name_key in sorted(WORKSET_TABLE.keys(), key=len, reverse=True):
-                if report.is_element_edited(link):
-                    continue
-                if link_name_key in link.Name:
-                    if link.Name == "PRKS-10.3_KOORD.rvt : 37 : позиция Встроенный":
-                        print link.Name
+    for link in link_instances:
+        if report.is_element_edited(link):
+            continue
 
-                    current_link = link
-                    current_workset = get_workset(worksets, WORKSET_TABLE[link_name_key])
-                    if current_workset is None:
-                        values = WORKSET_TABLE[link_name_key]
-                        print link.Name
-                        print("Не найден рабочий набор содержащий в себе: {}".format(", ".join(values)))
-                    else:
-                        set_link_ws(current_link, current_workset)
-                    break
+        file_name = link.Name.split(u" : ", 1)[0]
+        sections = get_sections(file_name)
+        candidates = worksets_by_section.get(sections[0], []) if len(sections) == 1 else []
+        if len(candidates) == 1:
+            assignments.append((link, candidates[0]))
+        elif candidates:
+            type_id = link.GetTypeId().GetIdValue()
+            if type_id not in choices_by_type:
+                choices_by_type[type_id] = WorksetChoice(
+                    file_name, sections, sorted(candidates, key=lambda ws: ws.Name), [])
+            choices_by_type[type_id].links.append(link)
+        else:
+            record_unmatched(unmatched, sections, link, workset_table)
 
+    if choices_by_type:
+        dialog = WorksetChoiceWindow(choices_by_type.values())
+        if not dialog.ShowDialog():
+            print u"Сопоставление отменено. Изменения в модель не внесены."
+            return
+
+        for choice, workset in dialog.selections():
+            for link in choice.links:
+                if workset is None:
+                    record_unmatched(unmatched, choice.sections, link, workset_table)
+                else:
+                    assignments.append((link, workset))
+
+    if assignments:
+        with revit.Transaction("BIM: Сопоставление РН"):
+            for link, workset in assignments:
+                set_link_ws(link, workset)
+
+    show_workset_report(link_instances.Count, len(assignments), unmatched, link_worksets, worksets_by_section)
     report.show_report()
+
 
 main()
