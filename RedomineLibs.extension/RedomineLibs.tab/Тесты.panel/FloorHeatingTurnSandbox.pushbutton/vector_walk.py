@@ -5,7 +5,10 @@ from __future__ import division
 import math
 import copy
 
-from route_timing import timed, timing_scope
+from route_timing import timed, timing_scope, record_counters
+from route_coverage import measure_coverage, DEFAULT_COVERAGE_THRESHOLD
+from route_cache import (RouteGeometryCache, FrozenContour, contour_key,
+                         memoized_boundary, memoized_projection, memoized_join)
 
 _timed_deepcopy = timed("copy.deepcopy")(copy.deepcopy)
 
@@ -15,6 +18,32 @@ from floor_heating_geometry import (TOLERANCE, _advance, _correct_entry,
                                   _distance, _inside, _on_segment, _offset_polygon,
                                   _ray_boundary_distance)
 from floor_heating_pair import _append_branch_segment, _entry_at_depth
+
+_ray_boundary_distance = memoized_boundary(_ray_boundary_distance)
+
+
+def _clone_branch(branch):
+    """Copy mutable search state, sharing only immutable route geometry.
+
+    The builder normalizes points to numeric tuples. Vertex and segment lists
+    are edited during trials, but their tuple contents are never edited.
+    Metadata (including nested candidate anchors and blocker lists) must remain
+    independent, since a rejected trial must not change its saved checkpoint.
+    """
+    result = dict(branch)
+    for key, value in branch.items():
+        if key in ("vertices", "segments"):
+            # Lists can also occur in diagnostic routes loaded from JSON.
+            result[key] = [item if isinstance(item, tuple) else copy.deepcopy(item)
+                           for item in value]
+        elif isinstance(value, (dict, list, set)):
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+@timed("clone_branches")
+def _clone_branches(branches):
+    return {side: _clone_branch(branch) for side, branch in branches.items()}
 
 
 def _record(journal, action, **details):
@@ -30,6 +59,12 @@ def route_length_mm(branches):
                for side in ("right", "left")
                for first, second in zip(branches[side]["vertices"],
                                         branches[side]["vertices"][1:]))
+
+
+def _total_route_length_mm(branches, join):
+    length = route_length_mm(branches)
+    bridge = join.get("bridge") if join.get("connected") else None
+    return length + _distance(*bridge) if bridge else length
 
 
 def calculate_start_points(polygon, right_start, left_start, normal,
@@ -168,17 +203,37 @@ def _visible_turn_count(vertices, entry_turns):
     return max(0, turns - entry_turns)
 
 
+def _clear_clipped_overlays(route):
+    route["abandoned_segments"] = []
+    history = [event for event in route["journal"] if event["action"] not in
+               ("abandoned_segment", "abandoned_segment_skipped")]
+    if len(history) != len(route["journal"]):
+        route["journal"] = history
+        for step, event in enumerate(history, 1):
+            event["step"] = step
+
+
 @timed("limit_route_length")
-def limit_route_length(route, max_total_length_mm):
-    """Keep the longest complete paired prefix that fits the length limit."""
+def limit_route_length(route, max_total_length_mm, include_bridge=None):
+    """Cap displayed geometry, retaining a paired prefix if the join cannot fit."""
     if (math.isnan(max_total_length_mm) or math.isinf(max_total_length_mm) or
             max_total_length_mm <= 0):
         raise ValueError("max_total_length_must_be_positive_and_finite")
-    full_length = route_length_mm(route["branches"])
-    route["length_limit_mm"] = max_total_length_mm
-    if full_length <= max_total_length_mm + TOLERANCE:
-        route["length_mm"] = full_length
-        route["length_limit_hit"] = False
+    if include_bridge is None:
+        # Direct callers can replay older journals without the command settings.
+        first = next(iter(route.get("journal", ())), {})
+        include_bridge = not first.get("action", "").startswith(
+            ("serpentine_", "single_serpentine_"))
+    visible_length = (_total_route_length_mm(route["branches"], route["join"])
+                      if include_bridge else route_length_mm(route["branches"]))
+    already_clipped = include_bridge and route.get("length_limit_hit", False)
+    full_length = route.get("full_length_mm", visible_length) if already_clipped else visible_length
+    if visible_length <= max_total_length_mm + TOLERANCE:
+        route["length_limit_mm"] = max_total_length_mm
+        route["length_mm"] = visible_length
+        route["length_limit_hit"] = already_clipped
+        if already_clipped:
+            _clear_clipped_overlays(route)
         return route
     vertices = {side: route["branches"][side]["vertices"]
                 for side in ("right", "left")}
@@ -200,6 +255,7 @@ def limit_route_length(route, max_total_length_mm):
             kept[side].append(point)
         current_length += pair_length
     limited = _timed_deepcopy(route)
+    limited["length_limit_mm"] = max_total_length_mm
     entry_turns = {side: sum(1 for event in limited["journal"]
                              if event["action"] == "entry_turn" and
                              event["branch"] == side)
@@ -214,16 +270,19 @@ def limit_route_length(route, max_total_length_mm):
         removed = kept[side].pop()
         current_length -= _distance(kept[side][-1], removed)
     for side in ("right", "left"):
-        limited["branches"][side]["vertices"] = kept[side]
-        limited["branches"][side]["stop_reason"] = "length_limit"
+        branch = limited["branches"][side]
+        branch["vertices"] = kept[side]
+        if include_bridge and "segments" in branch:
+            branch["segments"] = list(zip(kept[side], kept[side][1:]))
+        branch["stop_reason"] = "length_limit"
         turns = _visible_turn_count(kept[side], entry_turns[side])
-        limited["branches"][side]["turns_used"] = turns
+        branch["turns_used"] = turns
         limited["turns_by_branch"][side] = turns
         limited["stop_reason"][side] = "length_limit"
     limited["turns_used"] = sum(limited["turns_by_branch"].values())
     limited["join"] = {"connected": False, "reason": "length_limit"}
     limited["rollback"] = None
-    limited["abandoned_segments"] = []
+    _clear_clipped_overlays(limited)
     limited["length_mm"] = current_length
     limited["full_length_mm"] = full_length
     limited["length_limit_hit"] = True
@@ -231,6 +290,10 @@ def limit_route_length(route, max_total_length_mm):
             limit_mm=max_total_length_mm, built_length_mm=current_length,
             rejected_pair_length_mm=rejected_length,
             full_route_length_mm=full_length)
+    if (include_bridge and rejected_length == 0.0 and
+            route["join"].get("connected") and route["join"].get("bridge")):
+        limited["journal"][-1]["rejected_bridge_length_mm"] = _distance(
+            *route["join"]["bridge"])
     return limited
 
 
@@ -254,7 +317,7 @@ _contour_data_cache = None
 def _contour_data(contour, clockwise):
     """Reuse immutable derived geometry; validate the full coordinates each time."""
     global _contour_data_cache
-    key = (tuple(tuple(point) for point in contour), clockwise)
+    key = (contour_key(contour), clockwise)
     cached = _contour_data_cache
     if cached is not None and cached[0] == key:
         return cached[1]
@@ -272,6 +335,7 @@ def _contour_data(contour, clockwise):
 
 
 @timed("_contour_projection")
+@memoized_projection
 def _contour_projection(point, contour, clockwise, previous=None,
                         corner_reach=0.0, force_next=False):
     """Move the normal foot along its edge and across the next corner."""
@@ -452,19 +516,25 @@ def _can_travel(available, required, min_segment):
 
 def _axis_interval(segment, transverse, horizontal, clearance):
     first, second = segment
-    longitudinal_index = 0 if horizontal else 1
-    transverse_index = 1 if horizontal else 0
-    low_long = min(first[longitudinal_index], second[longitudinal_index])
-    high_long = max(first[longitudinal_index], second[longitudinal_index])
-    low_cross = min(first[transverse_index], second[transverse_index])
-    high_cross = max(first[transverse_index], second[transverse_index])
-    cross_distance = max(low_cross - transverse,
-                         transverse - high_cross, 0.0)
+    along = 0 if horizontal else 1
+    across = 1 - along
+    cross_a, cross_b = first[across], second[across]
+    if cross_a > cross_b:
+        cross_a, cross_b = cross_b, cross_a
+    # Reject a distant obstacle before computing its longitudinal extent.
+    cross_distance = cross_a - transverse
+    if cross_distance < 0.0:
+        cross_distance = transverse - cross_b
+        if cross_distance < 0.0:
+            cross_distance = 0.0
     if cross_distance >= clearance - TOLERANCE:
         return None
-    extension = math.sqrt(max(0.0, clearance * clearance -
-                              cross_distance * cross_distance))
-    return (low_long - extension, high_long + extension)
+    squared = clearance * clearance - cross_distance * cross_distance
+    extension = math.sqrt(squared if squared > 0.0 else 0.0)
+    low, high = first[along], second[along]
+    if low > high:
+        low, high = high, low
+    return (low - extension, high + extension)
 
 
 def _distance_to_interval(position, sign, interval):
@@ -672,7 +742,7 @@ def _paired_next_step_available(branches, first_side, second_side,
                                 contour, spacing, offset, min_segment,
                                 max_turns, clockwise, journal, round_index):
     """Try one complete paired move before treating narrow room as a dead end."""
-    trial = _timed_deepcopy(branches)
+    trial = _clone_branches(branches)
     first = trial[first_side]
     second = trial[second_side]
     probe_log = []
@@ -718,7 +788,7 @@ def _terminal_pair_without_reservation(branches, first_side, second_side,
                                        max_turns, clockwise, journal,
                                        round_index):
     """Try a final paired move without reserving a turn after the join."""
-    trial = _timed_deepcopy(branches)
+    trial = _clone_branches(branches)
     probe_log = []
     first_moved = _walk_one(
         trial[first_side], first_side, contour,
@@ -845,6 +915,16 @@ def _turn_preserves_partner_exit(trial_segments, sample, turn_direction,
         if not _can_travel(before["available_mm"], required, min_segment):
             continue
         had_exit = True
+        # If the new reservation does not touch this forward ray, appending it
+        # cannot change the already valid exit. All original obstacles and
+        # their order stay identical, so a second full scan would be redundant.
+        horizontal = abs(direction[0]) > TOLERANCE
+        axis = 0 if horizontal else 1
+        interval = _axis_interval(reservation["segment"], point[1-axis],
+                                  horizontal, spacing)
+        if (interval is None or _distance_to_interval(
+                point[axis], direction[axis], interval) is None):
+            return True
         after = probe_ray(point, direction, contour, other_segments,
                           obstacles + [reservation], spacing)
         required = offset if after["blocker"] == "boundary" else spacing
@@ -868,12 +948,16 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
     directions = _contour_directions(branch, contour, clockwise, spacing)
     # An obsolete outer support must not hide the only geometric exit of an
     # inner pass. Relax its ordering only after all preferred rays are blocked.
-    probes = [probe_ray(point, direction, contour, branch["segments"],
-                        other_obstacles, spacing) for name, direction in directions]
+    # Geometry stays unchanged until this step accepts a move. Reuse its
+    # initial rays; heading-only search does not need a contour fallback probe.
+    probes = ({name: probe_ray(point, direction, contour, branch["segments"],
+                               other_obstacles, spacing)
+               for name, direction in directions}
+              if branch.get("contour_guided", False) else {})
     if branch.get("contour_guided", False) and not any(
             _can_travel(probe["available_mm"],
                         offset if probe["blocker"] == "boundary" else spacing,
-                        min_segment) for probe in probes):
+                        min_segment) for probe in probes.values()):
         missing = [item for item in _directions(branch["heading"], clockwise)
                    if item[0] not in [name for name, vector in directions]]
         partner_segments = [item["segment"] for item in other_obstacles
@@ -907,13 +991,14 @@ def _walk_one(branch, side, contour, other_obstacles, spacing, offset,
         _record(journal, "backtrack_turn_priority", branch=side,
                 round=round_index, candidate=pending_turn)
         branch["pending_turn"] = None
-    if branch.get("recovery_only_direction") is not None:
-        directions = [item for item in directions if
-                      item[0] == branch["recovery_only_direction"]]
-        branch["recovery_only_direction"] = None
+    recovery_direction = branch.pop("recovery_only_direction", None)
+    if recovery_direction is not None:
+        directions = [item for item in directions if item[0] == recovery_direction]
     for name, direction in directions:
-        result = probe_ray(point, direction, contour, branch["segments"],
-                           other_obstacles, spacing)
+        result = probes.get(name)
+        if result is None:
+            result = probe_ray(point, direction, contour, branch["segments"],
+                               other_obstacles, spacing)
         _record(journal, "direction_probe", branch=side,
                 round=round_index, candidate=name, at=list(point),
                 result=result)
@@ -1293,6 +1378,7 @@ def _sequential_jog_without_parallel_overlap(first, second):
 
 
 @timed("_valid_join")
+@memoized_join
 def _valid_join(right, left, bridge, contour, spacing, min_segment):
     segments = []
     for side, vertices in (("right", right), ("left", left)):
@@ -1756,162 +1842,141 @@ def _recovery_checkpoints(original, first_side, contour, spacing,
     return unique
 
 
-@timed("_recover_pair_side")
-def _recover_pair_side(snapshots, first_side, second_side, contour,
-                       spacing, offset, min_segment, max_turns,
-                       clockwise, journal, allowed_turn,
-                       minimum_turn_room=None, excluded=None):
-    for snapshot in reversed(snapshots):
-        original = snapshot["branches"]
-        first_segment = original[first_side]["segments"][-1]
-        second_segment = original[second_side]["segments"][-1]
-        first_length = _distance(*first_segment)
-        second_length = _distance(*second_segment)
-        first_heading = original[first_side]["heading"]
-        second_heading = original[second_side]["heading"]
-        if (abs(first_heading[0] - second_heading[0]) > TOLERANCE or
-                abs(first_heading[1] - second_heading[1]) > TOLERANCE):
+def _record_recovery_moves(journal, probe_log):
+    for event in probe_log:
+        details = dict(event)
+        details.pop("step", None)
+        _record(journal, "recovery_" + details.pop("action"), **details)
+
+
+def _side_recoveries(snapshot, first_side, second_side, contour, spacing,
+                     offset, min_segment, max_turns, clockwise, journal,
+                     turn_name, turn_direction, checkpoints, minimum_turn_room):
+    original = snapshot["branches"]
+    first_segment = original[first_side]["segments"][-1]
+    second_segment = original[second_side]["segments"][-1]
+    first_length = _distance(*first_segment)
+    second_length = _distance(*second_segment)
+    first_heading = original[first_side]["heading"]
+    second_heading = original[second_side]["heading"]
+    index = 0 if abs(first_heading[0]) > TOLERANCE else 1
+    seen_points = set()
+    for checkpoint in checkpoints:
+        if checkpoint["turn"] is not None and checkpoint["turn"] != turn_name:
             continue
-        if (original[first_side]["turns_used"] >= max_turns or
-                original[second_side]["turns_used"] >= max_turns):
+        first_distance = checkpoint["distance_mm"]
+        if not _recovery_distance_allowed(
+                first_distance, first_length,
+                original[first_side].get("last_blocker"), min_segment):
             continue
-        index = 0 if abs(first_heading[0]) > TOLERANCE else 1
-        side_order = _contour_directions(
-            original[first_side], contour, clockwise, spacing)
-        checkpoints = _recovery_checkpoints(
-            original, first_side, contour, spacing, side_order)
-        for checkpoint in checkpoints:
-            first_distance = checkpoint["distance_mm"]
-            if not _recovery_distance_allowed(
-                    first_distance, first_length,
-                    original[first_side].get("last_blocker"), min_segment):
+        first_point = _advance(first_segment[0], first_heading,
+                               first_distance)
+        second_coordinate = first_point[index] - first_heading[index] * spacing
+        second_distance = ((second_coordinate - second_segment[0][index]) *
+                           second_heading[index])
+        if not _recovery_distance_allowed(
+                second_distance, second_length,
+                original[second_side].get("last_blocker"), min_segment):
+            continue
+        second_point = _advance(second_segment[0], second_heading,
+                                second_distance)
+        # A pipe offset and the step grid may describe exactly the same turn.
+        points = (first_point, second_point)
+        if points in seen_points:
+            continue
+        seen_points.add(points)
+        _record(journal, "pair_recovery_checkpoint_probe",
+                round=snapshot["round"], candidate=turn_name,
+                first_distance_mm=first_distance,
+                second_distance_mm=second_distance,
+                source=checkpoint["source"],
+                source_branch=checkpoint["source_branch"],
+                source_segment=checkpoint["source_segment"])
+        trial = _clone_branches(original)
+        for side, point in ((first_side, first_point),
+                            (second_side, second_point)):
+            branch = trial[side]
+            branch["vertices"][-1] = point
+            branch["segments"][-1] = (branch["segments"][-1][0], point)
+            branch["contour_anchor"] = _contour_projection(
+                point, contour, clockwise)
+            branch["stop_reason"] = None
+            branch["pending_turn"] = turn_name
+        if minimum_turn_room is not None:
+            enough_room = True
+            for side, other_side in ((first_side, second_side),
+                                     (second_side, first_side)):
+                branch = trial[side]
+                result = probe_ray(
+                    branch["vertices"][-1], turn_direction,
+                    contour, branch["segments"],
+                    _obstacles(trial[other_side], "other_branch"),
+                    spacing)
+                _record(journal, "pair_recovery_room_probe",
+                        round=snapshot["round"], branch=side,
+                        candidate=turn_name,
+                        threshold_mm=minimum_turn_room,
+                        result=result)
+                if result["available_mm"] + TOLERANCE < minimum_turn_room:
+                    enough_room = False
+            if not enough_room:
                 continue
-            first_point = _advance(first_segment[0], first_heading,
-                                   first_distance)
-            second_coordinate = first_point[index] - first_heading[index] * spacing
-            second_distance = ((second_coordinate - second_segment[0][index]) *
-                               second_heading[index])
-            if not _recovery_distance_allowed(
-                    second_distance, second_length,
-                    original[second_side].get("last_blocker"), min_segment):
-                continue
-            second_point = _advance(second_segment[0], second_heading,
-                                    second_distance)
-            for turn_name, turn_direction in side_order:
-                if turn_name == "forward":
-                    continue
-                if turn_name != allowed_turn:
-                    continue
-                if (checkpoint["turn"] is not None and
-                        checkpoint["turn"] != turn_name):
-                    continue
-                _record(journal, "pair_recovery_checkpoint_probe",
-                        round=snapshot["round"], candidate=turn_name,
-                        first_distance_mm=first_distance,
-                        second_distance_mm=second_distance,
-                        source=checkpoint["source"],
-                        source_branch=checkpoint["source_branch"],
-                        source_segment=checkpoint["source_segment"])
-                key = (snapshot["round"], first_point, second_point,
-                       turn_name)
-                if excluded is not None and key in excluded:
-                    continue
-                trial = _timed_deepcopy(original)
-                for side, point in ((first_side, first_point),
-                                    (second_side, second_point)):
-                    branch = trial[side]
-                    branch["vertices"][-1] = point
-                    branch["segments"][-1] = (branch["segments"][-1][0], point)
-                    branch["contour_anchor"] = _contour_projection(
-                        point, contour, clockwise)
-                    branch["stop_reason"] = None
-                    branch["pending_turn"] = turn_name
-                if minimum_turn_room is not None:
-                    enough_room = True
-                    for side, other_side in ((first_side, second_side),
-                                             (second_side, first_side)):
-                        branch = trial[side]
-                        result = probe_ray(
-                            branch["vertices"][-1], turn_direction,
-                            contour, branch["segments"],
-                            _obstacles(trial[other_side], "other_branch"),
-                            spacing)
-                        _record(journal, "pair_recovery_room_probe",
-                                round=snapshot["round"], branch=side,
-                                candidate=turn_name,
-                                threshold_mm=minimum_turn_room,
-                                result=result)
-                        if result["available_mm"] + TOLERANCE < minimum_turn_room:
-                            enough_room = False
-                    if not enough_room:
-                        continue
-                probe_log = []
-                first = trial[first_side]
-                second = trial[second_side]
-                first_moved = _walk_one(first, first_side, contour,
-                                        _obstacles(second, "other_branch"),
-                                        spacing, offset, min_segment,
-                                        max_turns, probe_log,
-                                        snapshot["round"] + 1, clockwise,
-                                        minimum_turn_room or 0.0)
-                if not first_moved:
-                    continue
-                reservation = _next_reservation(
-                    first, contour, _obstacles(second, "other_branch"),
-                    spacing, offset, min_segment, max_turns, probe_log,
-                    first_side, clockwise)
-                obstacles = _obstacles(first, "other_branch")
-                if reservation is not None:
-                    obstacles.append({"segment": reservation,
-                                      "kind": "first_turn_reservation"})
-                second_moved = _walk_one(
-                    second, second_side, contour, obstacles, spacing,
-                    offset, min_segment, max_turns, probe_log,
-                    snapshot["round"] + 1, clockwise,
-                    minimum_turn_room or 0.0)
-                moves = [event for event in probe_log
-                         if event["action"] == "segment"]
-                if (not second_moved or len(moves) != 2 or
-                        any(event["choice"] != turn_name for event in moves)):
-                    continue
-                join_trial = {side: {"vertices": trial[side]["vertices"]}
-                              for side in ("right", "left")}
-                join = _finish_route(join_trial, contour, spacing,
-                                     min_segment, probe_log, first_side)
-                if not join["connected"]:
-                    continue
-                details = {"from_round": snapshot["round"],
-                           "to_round": snapshot["round"] + 1,
-                           "first_checkpoint_mm": first_distance,
-                           "second_checkpoint_mm": second_distance,
-                           "first_limit_kind": original[first_side].get("last_blocker"),
-                           "second_limit_kind": original[second_side].get("last_blocker"),
-                           "turn": turn_name,
-                           "checkpoint_source": checkpoint["source"],
-                           "anchor_branch": checkpoint["source_branch"],
-                           "anchor_segment": checkpoint["source_segment"],
-                           "reason": "paired_turn_recovery"}
-                _record(journal, "pair_turn_recovery", **details)
-                if excluded is not None:
-                    excluded.add(key)
-                for event in probe_log:
-                    event = dict(event)
-                    event.pop("step", None)
-                    _record(journal, "recovery_" + event.pop("action"),
-                            **event)
-                return trial, join, details
-    _record(journal, "pair_turn_recovery_unavailable")
-    return None, None, None
+        probe_log = []
+        first = trial[first_side]
+        second = trial[second_side]
+        first_moved = _walk_one(first, first_side, contour,
+                                _obstacles(second, "other_branch"),
+                                spacing, offset, min_segment,
+                                max_turns, probe_log,
+                                snapshot["round"] + 1, clockwise,
+                                minimum_turn_room or 0.0)
+        if not first_moved:
+            continue
+        reservation = _next_reservation(
+            first, contour, _obstacles(second, "other_branch"),
+            spacing, offset, min_segment, max_turns, probe_log,
+            first_side, clockwise)
+        obstacles = _obstacles(first, "other_branch")
+        if reservation is not None:
+            obstacles.append({"segment": reservation,
+                              "kind": "first_turn_reservation"})
+        second_moved = _walk_one(
+            second, second_side, contour, obstacles, spacing,
+            offset, min_segment, max_turns, probe_log,
+            snapshot["round"] + 1, clockwise,
+            minimum_turn_room or 0.0)
+        moves = [event for event in probe_log
+                 if event["action"] == "segment"]
+        if (not second_moved or len(moves) != 2 or
+                any(event["choice"] != turn_name for event in moves)):
+            continue
+        join_trial = {side: {"vertices": trial[side]["vertices"]}
+                      for side in ("right", "left")}
+        join = _finish_route(join_trial, contour, spacing,
+                             min_segment, probe_log, first_side)
+        if not join["connected"]:
+            continue
+        details = {"from_round": snapshot["round"],
+                   "to_round": snapshot["round"] + 1,
+                   "first_checkpoint_mm": first_distance,
+                   "second_checkpoint_mm": second_distance,
+                   "first_limit_kind": original[first_side].get("last_blocker"),
+                   "second_limit_kind": original[second_side].get("last_blocker"),
+                   "turn": turn_name,
+                   "checkpoint_source": checkpoint["source"],
+                   "anchor_branch": checkpoint["source_branch"],
+                   "anchor_segment": checkpoint["source_segment"],
+                   "reason": "paired_turn_recovery"}
+        _record(journal, "pair_turn_recovery", **details)
+        _record_recovery_moves(journal, probe_log)
+        yield trial, join, details
 
 
 @timed("_recover_pair_forward")
 def _recover_pair_forward(snapshot, first_side, second_side, contour,
                           spacing, offset, min_segment, max_turns,
-                          clockwise, journal, excluded):
-    key = (snapshot["round"], "forward")
-    if excluded is not None and key in excluded:
-        return None, None, None
-    trial = _timed_deepcopy(snapshot["branches"])
+                          clockwise, journal):
+    trial = _clone_branches(snapshot["branches"])
     first = trial[first_side]
     second = trial[second_side]
     if (first["turns_used"] >= max_turns or
@@ -1976,123 +2041,134 @@ def _recover_pair_forward(snapshot, first_side, second_side, contour,
                 candidate=primary_name,
                 at=list(previous["vertices"][-1]), result=rejected)
     _record(journal, "pair_forward_recovery", **details)
-    if excluded is not None:
-        excluded.add(key)
-    for event in probe_log:
-        event = dict(event)
-        event.pop("step", None)
-        _record(journal, "recovery_" + event.pop("action"), **event)
+    _record_recovery_moves(journal, probe_log)
     return trial, join, details
 
 
-@timed("_recover_pair_turn")
-def _recover_pair_turn(snapshots, first_side, second_side, contour,
-                       spacing, offset, min_segment, max_turns,
-                       clockwise, journal, minimum_turn_room=None,
-                       excluded=None, require_join=True):
-    if not snapshots:
-        return None, None, None
-    for snapshot in reversed(snapshots):
-        order = [item[0] for item in _contour_directions(
-            snapshot["branches"][first_side], contour, clockwise, spacing)]
-        rejected = set(event["choice"] for event in journal
-                       if event["action"] == "segment" and
-                       event.get("round") == snapshot["round"] + 1 and
-                       event.get("branch") == first_side)
-        # The follower can leave a pocket on a different side from the leader.
-        partner_order = [None] + [item[0] for item in _contour_directions(
-            snapshot["branches"][second_side], contour, clockwise, spacing)]
-        for choice, partner_choice in ((a, b) for a in order for b in partner_order):
-            if choice in rejected:
-                continue
-            key = (snapshot["round"], "vertex", choice, partner_choice)
-            if excluded is not None and key in excluded:
-                continue
-            trial = _timed_deepcopy(snapshot["branches"])
-            first = trial[first_side]
-            second = trial[second_side]
-            first["stop_reason"] = None
+def _vertex_recoveries(snapshot, first_side, second_side, contour, spacing,
+                       offset, min_segment, max_turns, clockwise, journal,
+                       directions, partner_choices, rejected, require_join):
+    original = snapshot["branches"]
+    partner_obstacles = _obstacles(original[second_side], "other_branch")
+    for choice, _ in directions:
+        if choice in rejected:
+            continue
+        # The first move and its reservation depend only on the saved partner
+        # segments. Branch the search when the follower actually makes a choice.
+        first = _clone_branch(original[first_side])
+        first["stop_reason"] = None
+        first["pending_turn"] = choice
+        first["recovery_only_direction"] = choice
+        first_log = []
+        moved = _walk_one(first, first_side, contour, partner_obstacles, spacing,
+                          offset, min_segment, max_turns, first_log,
+                          snapshot["round"] + 1, clockwise)
+        move = next((e for e in first_log if e["action"] == "segment"), None)
+        _record(journal, "pair_vertex_probe", round=snapshot["round"],
+                candidate=choice, first_moved=moved,
+                first_choice=move["choice"] if move else None)
+        if not moved or move is None or move["choice"] != choice:
+            continue
+        reservation = _next_reservation(first, contour, partner_obstacles,
+            spacing, offset, min_segment, max_turns, first_log, first_side, clockwise)
+        obstacles = _obstacles(first, "other_branch")
+        if reservation is not None:
+            obstacles.append({"segment": reservation, "kind": "first_turn_reservation"})
+        for partner_choice in partner_choices:
+            second = _clone_branch(original[second_side])
             second["stop_reason"] = None
             if partner_choice is not None:
                 second["recovery_only_direction"] = partner_choice
-            first["pending_turn"] = choice
-            first["recovery_only_direction"] = choice
-            probe_log = []
-            first_moved = _walk_one(
-                first, first_side, contour,
-                _obstacles(second, "other_branch"), spacing, offset,
-                min_segment, max_turns, probe_log,
-                snapshot["round"] + 1, clockwise)
-            moves = [event for event in probe_log
-                     if event["action"] == "segment"]
-            _record(journal, "pair_vertex_probe", round=snapshot["round"],
-                    candidate=choice, first_moved=first_moved,
-                    first_choice=(moves[0]["choice"] if moves else None))
-            if not first_moved or not moves or moves[0]["choice"] != choice:
+            probe_log = list(first_log)
+            moved = _walk_one(second, second_side, contour, obstacles, spacing,
+                              offset, min_segment, max_turns, probe_log,
+                              snapshot["round"] + 1, clockwise)
+            _record(journal, "pair_vertex_second_probe", round=snapshot["round"],
+                    candidate=choice, second_moved=moved)
+            if not moved:
                 continue
-            reservation = _next_reservation(
-                first, contour, _obstacles(second, "other_branch"),
-                spacing, offset, min_segment, max_turns, probe_log,
-                first_side, clockwise)
-            obstacles = _obstacles(first, "other_branch")
-            if reservation is not None:
-                obstacles.append({"segment": reservation,
-                                  "kind": "first_turn_reservation"})
-            second_moved = _walk_one(
-                second, second_side, contour, obstacles, spacing, offset,
-                min_segment, max_turns, probe_log,
-                snapshot["round"] + 1, clockwise)
-            _record(journal, "pair_vertex_second_probe",
-                    round=snapshot["round"], candidate=choice,
-                    second_moved=second_moved)
-            if not second_moved:
+            trial = {first_side: _clone_branch(first), second_side: second}
+            join = _finish_route({s: {"vertices": b["vertices"]} for s, b in trial.items()},
+                                 contour, spacing, min_segment, probe_log, first_side)
+            _record(journal, "pair_vertex_join_probe", round=snapshot["round"],
+                    candidate=choice, connected=join["connected"], reason=join.get("reason"))
+            if require_join and not join["connected"]:
                 continue
-            joined = _finish_route({side: {"vertices": trial[side]["vertices"]}
-                              for side in ("right", "left")}, contour, spacing,
-                                   min_segment, probe_log, first_side)
-            _record(journal, "pair_vertex_join_probe",
-                    round=snapshot["round"], candidate=choice,
-                    connected=joined["connected"],
-                    reason=joined.get("reason"))
-            # Speculative continuations are validated as complete routes;
-            # they need not be connectable immediately after this one step.
-            if require_join and not joined["connected"]:
-                continue
-            details = {"from_round": snapshot["round"],
-                       "to_round": snapshot["round"] + 1,
-                       "turn": choice,
-                       "reason": "paired_vertex_recovery",
+            details = {"from_round": snapshot["round"], "to_round": snapshot["round"] + 1,
+                       "turn": choice, "reason": "paired_vertex_recovery",
                        "partner_turn": partner_choice}
             _record(journal, "pair_vertex_recovery", **details)
-            if excluded is not None:
-                excluded.add(key)
-            for event in probe_log:
-                event = dict(event)
-                event.pop("step", None)
-                _record(journal, "recovery_" + event.pop("action"),
-                        **event)
-            return trial, joined, details
-        for choice in order:
-            if choice == "forward":
-                result = _recover_pair_forward(
-                    snapshot, first_side, second_side, contour, spacing,
-                    offset, min_segment, max_turns, clockwise, journal,
-                    excluded)
-            else:
-                result = _recover_pair_side(
-                    [snapshot], first_side, second_side, contour, spacing,
-                    offset, min_segment, max_turns, clockwise, journal,
-                    choice, minimum_turn_room, excluded)
-            if result[0] is not None:
-                return result
-    return None, None, None
+            _record_recovery_moves(journal, probe_log)
+            yield trial, join, details
+
+
+def _pair_recoveries(snapshots, first_side, second_side, contour, spacing,
+                     offset, min_segment, max_turns, clockwise, journal,
+                     minimum_turn_room=None, require_join=True, exhausted=None):
+    """Enumerate each turn once for these snapshots, policies and geometry."""
+    if exhausted:
+        # Rounds are unique within this continuation. A recovery that replaces
+        # the snapshots also clears the exhausted rounds.
+        snapshots = [s for s in snapshots if s["round"] not in exhausted]
+    if not snapshots:
+        return
+    rejected = {}
+    for event in journal:
+        if event["action"] == "segment" and event.get("branch") == first_side:
+            rejected.setdefault(event.get("round"), set()).add(event["choice"])
+    for saved in reversed(snapshots):
+        round_index = saved["round"]
+        # Direction selection may rebind a contour anchor. Only the per-search
+        # copy may change; the saved state is shared by alternative completions.
+        original = {side: dict(branch) for side, branch in saved["branches"].items()}
+        snapshot = {"round": round_index, "branches": original}
+        first, second = original[first_side], original[second_side]
+        directions = _contour_directions(first, contour, clockwise, spacing)
+        partner_choices = [None] + [name for name, direction in
+                                    _contour_directions(second, contour, clockwise, spacing)]
+        for recovery in _vertex_recoveries(snapshot, first_side, second_side, contour,
+                spacing, offset, min_segment, max_turns, clockwise, journal, directions,
+                partner_choices, rejected.get(round_index + 1, ()), require_join):
+            yield recovery
+
+        checkpoints = []
+        if (first["segments"] and second["segments"] and
+                max(first["turns_used"], second["turns_used"]) < max_turns and
+                all(abs(a-b) <= TOLERANCE for a, b in zip(first["heading"], second["heading"]))):
+            checkpoints = _recovery_checkpoints(original, first_side, contour, spacing, directions)
+        for name, direction in directions:
+            if name == "forward":
+                recovery = _recover_pair_forward(snapshot, first_side, second_side,
+                    contour, spacing, offset, min_segment, max_turns, clockwise, journal)
+                if recovery[0] is not None:
+                    yield recovery
+            elif checkpoints:
+                candidates = _side_recoveries(snapshot, first_side, second_side, contour,
+                    spacing, offset, min_segment, max_turns, clockwise, journal,
+                    name, direction, checkpoints, minimum_turn_room)
+                while True:
+                    # Time the work of advancing the iterator, excluding the
+                    # caller's continuation while the iterator is suspended.
+                    with timing_scope("_recover_pair_side"):
+                        recovery = next(candidates, None)
+                    if recovery is None:
+                        break
+                    yield recovery
+                _record(journal, "pair_turn_recovery_unavailable")
+        if exhausted is not None:
+            exhausted.add(round_index)
+
+
+@timed("_recover_pair_turn")
+def _next_pair_recovery(candidates):
+    return next(candidates, (None, None, None))
 
 
 def _lead_then_catch(branches, first_side, second_side, contour,
                      spacing, offset, min_segment, max_turns,
                      clockwise, round_index):
     """Let the first branch clear the exit, then let the second catch up."""
-    trial = _timed_deepcopy(branches)
+    trial = _clone_branches(branches)
     log = []
     first = trial[first_side]
     second = trial[second_side]
@@ -2138,7 +2214,7 @@ def _lead_then_catch(branches, first_side, second_side, contour,
                                    event["choice"] == "forward"
                                    for event in log):
         return None, None, log
-    paired_snapshot = _timed_deepcopy(trial)
+    paired_snapshot = _clone_branches(trial)
     _record(log, "recovery_lead_skip_first", branch=first_side,
             round=round_index + 1)
     reservation = _next_reservation(
@@ -2171,13 +2247,12 @@ def _search_pair_completion(branches, snapshots, first_side, second_side,
     with the saved finish, including the bridge, before committing anything.
     """
     def length(candidate, join):
-        candidate = _timed_deepcopy(candidate)
+        candidate = _clone_branches(candidate)
         _simplify_pair_route(candidate, join, contour, spacing, min_segment,
                              [], first_side)
-        return (route_length_mm(candidate) +
-                (_distance(*join["bridge"]) if join.get("bridge") else 0.0))
+        return _total_route_length_mm(candidate, join)
 
-    best = _timed_deepcopy(branches)
+    best = _clone_branches(branches)
     best_log = []
     best_join = _finish_route(best, contour, spacing, min_segment,
                               best_log, first_side)
@@ -2186,13 +2261,20 @@ def _search_pair_completion(branches, snapshots, first_side, second_side,
     terminal, terminal_join = _terminal_pair_without_reservation(
         branches, first_side, second_side, contour, spacing, offset,
         min_segment, max_turns, clockwise, terminal_log, round_index)
-    if terminal is not None and length(terminal, terminal_join) >= best_length:
-        best, best_join, best_log = terminal, terminal_join, terminal_log
-        best_length = length(best, best_join)
+    if terminal is not None:
+        terminal_length = length(terminal, terminal_join)
+        if terminal_length >= best_length:
+            best, best_join, best_log = terminal, terminal_join, terminal_log
+            best_length = terminal_length
     # A longer recovery must not shift a completed boundary pass inward.
     # Pipe clearance alone permits that shift and can hide the lost outer lane.
     required_coverage = _boundary_coverage({"contour": contour, "branches": branches}, spacing)
-    excluded = set()
+    sources = {snapshot["round"]: snapshot["branches"] for snapshot in snapshots}
+    trial_log = list(journal)
+    candidates = _pair_recoveries(snapshots, first_side, second_side, contour,
+        spacing, offset, min_segment, max_turns, clockwise, trial_log, require_join=False)
+    tried_states = {}
+    duplicate_continuations = 0
     selected_details = None
     attempt = 0
     # Bound the number of independent candidates by the caller's round limit.
@@ -2200,26 +2282,32 @@ def _search_pair_completion(branches, snapshots, first_side, second_side,
     if search_budget is None:
         search_budget = [max_rounds]
     while search_budget[0] > 0:
-        search_budget[0] -= 1
-        # Trial events must not affect rejection filters of later candidates.
-        trial_log = list(journal)
+        # Resume the same iterator with a clean diagnostic history for this trial.
+        trial_log[:] = journal
         log_start = len(trial_log)
-        recovered, recovered_join, details = _recover_pair_turn(
-            snapshots, first_side, second_side, contour, spacing, offset,
-            min_segment, max_turns, clockwise, trial_log, excluded=excluded,
-            require_join=False)
+        recovered, recovered_join, details = _next_pair_recovery(candidates)
         if recovered is None:
             break
-        attempt += 1
         if details["turn"] != "forward":
-            source = next(s["branches"] for s in snapshots
-                          if s["round"] == details["from_round"])
+            source = sources[details["from_round"]]
             for side in (first_side, second_side):
                 recovered[side]["returning_from_protrusion"] = source[side]["heading"]
+        start_round = details["to_round"] + 1
+        # Different choices can produce an identical pair. The round and tips
+        # only select a small bucket; equality includes both entire branch states.
+        tips = (start_round, tuple(recovered[first_side]["vertices"][-1]),
+                tuple(recovered[second_side]["vertices"][-1]))
+        states = tried_states.setdefault(tips, [])
+        if recovered in states:
+            duplicate_continuations += 1
+            continue
+        states.append(_clone_branches(recovered))
+        search_budget[0] -= 1
+        attempt += 1
         completed_join, later_details = _continue_after_recovery(
             recovered, first_side, second_side, contour, spacing, offset,
             min_segment, max_turns, max_rounds, clockwise,
-            details["to_round"] + 1, trial_log, search_alternatives=False,
+            start_round, trial_log, search_alternatives=False,
             # Each independent candidate receives the same continuation budget;
             # nested speculative searches cannot exhaust it for later candidates.
             search_budget=[max_rounds])
@@ -2258,7 +2346,8 @@ def _search_pair_completion(branches, snapshots, first_side, second_side,
         _record(journal, event.pop("action"), **event)
     _record(journal, "pair_completion_selected", round=round_index,
             method=("recovery_continuation" if selected_details else "saved_finish"),
-            attempts=attempt, length_mm=length(best, best_join))
+            attempts=attempt, duplicate_continuations=duplicate_continuations,
+            length_mm=best_length)
     return best, best_join, selected_details
 
 
@@ -2267,10 +2356,10 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                              spacing, offset, min_segment, max_turns,
                              max_rounds, clockwise, start_round, journal,
                              search_alternatives=True, search_budget=None):
-    snapshots = [{"round": start_round - 1, "branches": _timed_deepcopy(branches)}]
-    used_recoveries = set()
+    snapshots = [{"round": start_round - 1, "branches": _clone_branches(branches)}]
+    exhausted = set()
     latest_recovery = None
-    joined_trial = _timed_deepcopy(branches)
+    joined_trial = _clone_branches(branches)
     last_join = _finish_route(joined_trial, contour, spacing,
                               min_segment, journal, first_side)
     last_vertices = {side: list(joined_trial[side]["vertices"])
@@ -2296,7 +2385,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 event = dict(event)
                 event.pop("step", None)
                 _record(journal, event.pop("action"), **event)
-            joined_trial = _timed_deepcopy(branches)
+            joined_trial = _clone_branches(branches)
             candidate_join = _finish_route(joined_trial, contour, spacing,
                                            min_segment, journal, first_side)
             if candidate_join["connected"]:
@@ -2338,8 +2427,8 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                                  max_turns, journal, round_index, clockwise)
         if first_moved and second_moved:
             snapshots.append({"round": round_index,
-                              "branches": _timed_deepcopy(branches)})
-        trial = _timed_deepcopy(branches)
+                              "branches": _clone_branches(branches)})
+        trial = _clone_branches(branches)
         candidate_join = _finish_route(trial, contour, spacing,
                                        min_segment, journal, first_side)
         _record(journal, "recovery_continuation", round=round_index,
@@ -2350,7 +2439,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 branches[first_side]["turns_used"] ==
                 branches[second_side]["turns_used"] and
                 not _walk_one(
-                    _timed_deepcopy(branches[first_side if first_moved else
+                    _clone_branch(branches[first_side if first_moved else
                                            second_side]),
                     first_side if first_moved else second_side,
                     contour,
@@ -2371,7 +2460,7 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                     _distance(_advance(first_vertices[-1],
                                        turn_direction, turn_run),
                               second_end) <= TOLERANCE):
-                direct = _timed_deepcopy(trial)
+                direct = _clone_branches(trial)
                 direct[first_side]["vertices"].append(second_end)
                 valid, reason = _valid_join(
                     direct["right"]["vertices"],
@@ -2432,10 +2521,10 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
         if tight_sides:
             inbound_headings = {side: branches[side]["heading"]
                                 for side in ("right", "left")}
-            recovered, recovered_join, details = _recover_pair_turn(
-                snapshots, first_side, second_side, contour,
-                spacing, offset, min_segment, max_turns, clockwise,
-                journal, excluded=used_recoveries)
+            candidates = _pair_recoveries(snapshots, first_side, second_side,
+                contour, spacing, offset, min_segment, max_turns, clockwise,
+                journal, exhausted=exhausted)
+            recovered, recovered_join, details = _next_pair_recovery(candidates)
             if recovered is not None:
                 if details["turn"] != "forward":
                     for side in ("right", "left"):
@@ -2443,7 +2532,8 @@ def _continue_after_recovery(branches, first_side, second_side, contour,
                 branches.clear()
                 branches.update(recovered)
                 snapshots = []
-                joined_trial = _timed_deepcopy(branches)
+                exhausted.clear()
+                joined_trial = _clone_branches(branches)
                 candidate_join = _finish_route(
                     joined_trial, contour, spacing, min_segment,
                     journal, first_side)
@@ -2511,7 +2601,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
         raise ValueError("entry_direction_must_be_orthogonal_unit_vector")
     if len(polygon) < 4:
         raise ValueError("orthogonal_polygon_requires_four_vertices")
-    contour = _offset_polygon(polygon, float(offset_mm))
+    contour = FrozenContour(_offset_polygon(polygon, float(offset_mm)))
     journal = []
     _record(journal, "input", polygon=[list(point) for point in polygon],
             right_start=list(right_start), left_start=list(left_start),
@@ -2632,7 +2722,7 @@ def _build_vector_route_once(polygon, right_start, left_start,
                                  journal, round_index, clockwise)
         if first_moved and second_moved:
             pair_snapshots.append({"round": round_index,
-                                   "branches": _timed_deepcopy(branches)})
+                                   "branches": _clone_branches(branches)})
         trial = {side: {"vertices": list(branches[side]["vertices"])}
                  for side in ("right", "left")}
         checkpoint_join = _finish_route(trial, contour, spacing_mm,
@@ -2700,9 +2790,9 @@ def _build_vector_route_once(polygon, right_start, left_start,
         join = _finish_route(branches, contour, spacing_mm,
                              min_segment_mm, journal, first_side)
     if not join["connected"]:
-        recovered, recovered_join, rollback = _recover_pair_turn(
-            pair_snapshots, first_side, second_side, contour, spacing_mm,
-            offset_mm, min_segment_mm, max_turns, clockwise, journal)
+        candidates = _pair_recoveries(pair_snapshots, first_side, second_side,
+            contour, spacing_mm, offset_mm, min_segment_mm, max_turns, clockwise, journal)
+        recovered, recovered_join, rollback = _next_pair_recovery(candidates)
         if recovered is not None:
             branches = recovered
             join, continued_rollback = _continue_after_recovery(
@@ -2781,7 +2871,7 @@ def _complete_inward_bypass(route, spacing, offset, minimum,
     geometry on the spacing grid, then validate the complete pair.
     """
     first, second = ("left", "right") if clockwise else ("right", "left")
-    original = _timed_deepcopy(route["branches"])
+    original = _clone_branches(route["branches"])
     # Reopen simplified bypasses only in the search copy. Keep the accepted
     # route unless a complete, clear continuation improves it.
     for event in reversed(route["journal"]):
@@ -2795,7 +2885,7 @@ def _complete_inward_bypass(route, spacing, offset, minimum,
                 vertices[start:start+len(new_path)] = [tuple(p) for p in event["old_path"]]
                 break
     best = route
-    best_length = route_length_mm(route["branches"])
+    best_length = _total_route_length_mm(route["branches"], route["join"])
     budget = [max_rounds]
     fv, sv = original[first]["vertices"], original[second]["vertices"]
     for index in range(2, len(fv)-1):
@@ -2828,7 +2918,7 @@ def _complete_inward_bypass(route, spacing, offset, minimum,
             follower_end = tuple(b[k]-heading[k]*spacing+inward[k]*spacing for k in (0, 1))
             if not _on_segment(follower_end, u, v):
                 continue
-            prefix = _timed_deepcopy(original)
+            prefix = _clone_branches(original)
             prefix[first]["vertices"] = list(fv[:index+1])
             prefix[second]["vertices"] = list(sv[:other_index]) + [follower_end]
             for branch in prefix.values():
@@ -2849,7 +2939,7 @@ def _complete_inward_bypass(route, spacing, offset, minimum,
                 if budget[0] <= 0:
                     return best
                 budget[0] -= 1
-                trial = _timed_deepcopy(prefix)
+                trial = _clone_branches(prefix)
                 for side in (first, second):
                     branch = trial[side]
                     start = branch["vertices"][-1]
@@ -2887,7 +2977,7 @@ def _complete_inward_bypass(route, spacing, offset, minimum,
                 valid, reason = _valid_join(trial["right"]["vertices"],
                     trial["left"]["vertices"], join.get("bridge"),
                     route["contour"], spacing, minimum)
-                length_mm = route_length_mm(trial)
+                length_mm = _total_route_length_mm(trial, join)
                 if prefix_coverage is None:
                     prefix_coverage = _boundary_coverage(
                         {"contour": route["contour"], "branches": prefix}, spacing)
@@ -2923,7 +3013,7 @@ def _complete_entry_bypass(route, normal, spacing, offset, minimum,
     direction. Collinear checkpoint vertices must not become false corners.
     """
     first, second = ("left", "right") if clockwise else ("right", "left")
-    original = _timed_deepcopy(route["branches"])
+    original = _clone_branches(route["branches"])
     for branch in original.values():
         vertices = []
         for point in branch["vertices"]:
@@ -2947,8 +3037,7 @@ def _complete_entry_bypass(route, normal, spacing, offset, minimum,
             or abs(sum(heading[k]*resume[k] for k in (0, 1))) > TOLERANCE):
         return route
     best = route
-    best_length = route_length_mm(route["branches"]) + (
-        _distance(*route["join"]["bridge"]) if route["join"].get("bridge") else 0)
+    best_length = _total_route_length_mm(route["branches"], route["join"])
     follower = original[second]["vertices"]
     a, b = follower[-2:]
     length = _distance(a, b)
@@ -2957,7 +3046,7 @@ def _complete_entry_bypass(route, normal, spacing, offset, minimum,
     for step in range(1, int((length-minimum)/spacing) + 1):
         if budget[0] <= 0:
             break
-        trial = _timed_deepcopy(original)
+        trial = _clone_branches(original)
         trial[second]["vertices"][-1] = _advance(b, heading, -step*spacing)
         possible = True
         for side in (first, second):
@@ -2984,7 +3073,7 @@ def _complete_entry_bypass(route, normal, spacing, offset, minimum,
         _simplify_pair_route(trial, join, route["contour"], spacing, minimum, log, first)
         valid, reason = _valid_join(trial["right"]["vertices"], trial["left"]["vertices"],
                                     join.get("bridge"), route["contour"], spacing, minimum)
-        length_mm = route_length_mm(trial) + (_distance(*join["bridge"]) if join.get("bridge") else 0)
+        length_mm = _total_route_length_mm(trial, join)
         if valid and length_mm > best_length + 2*spacing + TOLERANCE:
             best = _timed_deepcopy(route)
             best["branches"], best["join"] = trial, join
@@ -3036,10 +3125,9 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
     if not route["join"].get("connected"):
         return route
     branches = route["branches"]
-    bridge = route["join"].get("bridge")
     # A cap of one spacing proves pair clearance, not exhaustion of the
     # inner room. Reopen it only if a complete paired advance adds length.
-    original_length = route_length_mm(branches) + (_distance(*bridge) if bridge else 0)
+    original_length = _total_route_length_mm(branches, route["join"])
     first, second = ("left", "right") if clockwise else ("right", "left")
     fv, sv = branches[first]["vertices"], branches[second]["vertices"]
     required_coverage = None
@@ -3062,17 +3150,17 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
                     abs(sum((c[k]-a[k])*inward[k] for k in (0, 1))-spacing) > TOLERANCE or
                     abs(_segment_clearance((a, b), (c, d))-spacing) > TOLERANCE):
                 continue
-            trial = _timed_deepcopy(branches)
+            trial = _clone_branches(branches)
             trial[first]["vertices"] = list(fv[:i])
             trial[second]["vertices"] = list(sv[:j])
             best = None
             best_length = original_length + 2*spacing
-            seed = _timed_deepcopy(trial)
+            seed = _clone_branches(trial)
             log = []
             # The longest run can trap its partner at a protrusion. Test
             # earlier paired corners on the caller's spacing grid as well.
             for trim in range(int(length / spacing) + 1):
-                trial = _timed_deepcopy(seed)
+                trial = _clone_branches(seed)
                 heading = tuple((b[k]-a[k])/length for k in (0, 1))
                 inward = (heading[1], -heading[0]) if clockwise else (-heading[1], heading[0])
                 for turn in range(max_turns + 1):
@@ -3095,7 +3183,7 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
                     if not _valid_join(trial["right"]["vertices"], trial["left"]["vertices"],
                                        None, route["contour"], spacing, minimum)[0]:
                         break
-                    closed = _timed_deepcopy(trial)
+                    closed = _clone_branches(trial)
                     join = _finish_route(closed, route["contour"], spacing, minimum, log, first)
                     if join.get("connected"):
                         for branch in closed.values():
@@ -3105,7 +3193,7 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
                                 if abs((bb[0]-aa[0])*(cc[1]-bb[1])-(bb[1]-aa[1])*(cc[0]-bb[0])) > TOLERANCE)
                             branch["heading"] = heading
                             branch["stop_reason"] = "paired_terminal_cap"
-                        total = route_length_mm(closed) + (_distance(*join["bridge"]) if join.get("bridge") else 0)
+                        total = _total_route_length_mm(closed, join)
                         if max(branch["turns_used"] for branch in closed.values()) <= max_turns and total > best_length + TOLERANCE:
                             # A longer inner completion must retain the outer
                             # sweep, including the lane around the inlet.
@@ -3128,7 +3216,7 @@ def _complete_terminal_pair(route, spacing, minimum, max_turns, clockwise):
                 result["turns_used"] = sum(result["turns_by_branch"].values())
                 result["stop_reason"] = {side: "paired_terminal_cap" for side in branches}
                 if "length_mm" in result:
-                    result["length_mm"] = route_length_mm(result["branches"])
+                    result["length_mm"] = _total_route_length_mm(closed, join)
                 _record(result["journal"], "terminal_pair_completed", first_segment=i-1,
                         second_segment=j-1, paired_turns=turns, length_mm=best_length,
                         corner_trim_mm=best_trim,
@@ -3258,9 +3346,13 @@ def _finalize_vector_candidate(route, entry_direction, spacing_mm, offset_mm,
 def build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
-                       clockwise=False):
-    route = _build_vector_route(polygon, right_start, left_start, entry_direction,
-        max_turns, offset_mm, spacing_mm, min_segment_mm, max_rounds, clockwise)
+                       clockwise=False, max_length_mm=None,
+                       coverage_threshold=DEFAULT_COVERAGE_THRESHOLD):
+    with RouteGeometryCache() as cache:
+        route = _build_vector_route(polygon, right_start, left_start, entry_direction,
+            max_turns, offset_mm, spacing_mm, min_segment_mm, max_rounds,
+            clockwise, max_length_mm, coverage_threshold)
+    record_counters("geometry_cache", cache.stats())
     report_stage(u"Маршрут рассчитан", 0.90)
     return route
 
@@ -3268,84 +3360,117 @@ def build_vector_route(polygon, right_start, left_start, entry_direction,
 def _build_vector_route(polygon, right_start, left_start, entry_direction,
                        max_turns, offset_mm=200.0, spacing_mm=150.0,
                        min_segment_mm=1.0, max_rounds=500,
-                       clockwise=False):
+                       clockwise=False, max_length_mm=None,
+                       coverage_threshold=DEFAULT_COVERAGE_THRESHOLD):
+    if coverage_threshold is not None and not 0.0 < coverage_threshold <= 1.0:
+        raise ValueError("coverage_threshold_must_be_between_zero_and_one")
     arguments = (polygon, right_start, left_start, entry_direction,
                  max_turns, offset_mm, spacing_mm, min_segment_mm,
                  max_rounds, clockwise)
-    report_stage(u"Расчёт маршрута: вариант 1/3", 0.05)
-    with timing_scope("variant_1"):
-        route = _build_vector_route_once(*(arguments + (True,)))
-        route = _finalize_vector_candidate(route, entry_direction, spacing_mm, offset_mm,
-            min_segment_mm, max_turns, max_rounds, clockwise)
-    failure = None
-    if not route["join"]["connected"]:
-        failure = route["join"].get("reason", "no_join")
-    else:
-        try:
-            checked = start_at_calculated_entries(_timed_deepcopy(route))
-        except ValueError as error:
-            failure = error.args[0] if error.args else "invalid_entry"
-    if failure is None:
-        # A valid join alone does not prove coverage. Compare independent
-        # completions after entry trimming and pair simplification. Require
-        # at least one full paired advance (one spacing on each branch).
-        best_length = route_length_mm(checked["branches"]) + (
-            _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
-        required_coverage = _boundary_coverage(checked, spacing_mm)
-        for variant, (guided, rebind) in enumerate(((True, True), (False, False)), 2):
-            report_stage(u"Расчёт маршрута: вариант {0}/3".format(variant),
-                         0.30 if variant == 2 else 0.55)
-            with timing_scope("variant_{0}".format(variant)):
-                candidate = _build_vector_route_once(*(arguments + (guided, rebind)))
-                candidate = _finalize_vector_candidate(candidate, entry_direction,
-                    spacing_mm, offset_mm, min_segment_mm, max_turns, max_rounds, clockwise)
-            if not candidate["join"]["connected"]:
-                continue
+    # Keep stable policy names in the journal even when execution order changes.
+    variants = (("contour_progress", True, False),
+                ("heading_priority", False, False),
+                ("inner_support", True, True))
+    best = None
+    best_length = -1.0
+    best_policy = None
+    best_variant = None
+    required_boundary = None
+    first_attempt = None
+    first_failure = None
+    summaries = []
+    stopped_early = False
+    for variant, (policy, guided, rebind) in enumerate(variants, 1):
+        report_stage(u"Расчёт маршрута: вариант {0}/3".format(variant),
+                     (0.05, 0.30, 0.55)[variant-1])
+        with timing_scope("variant_{0}".format(variant)):
+            candidate = _build_vector_route_once(*(arguments + (guided, rebind)))
+            candidate = _finalize_vector_candidate(candidate, entry_direction,
+                spacing_mm, offset_mm, min_segment_mm, max_turns, max_rounds, clockwise)
+        if first_attempt is None:
+            first_attempt = candidate
+        summary = {"variant": variant, "policy": policy, "became_best": False,
+                   "valid": False, "coverage": None, "early_accept": False}
+        summaries.append(summary)
+        reason = candidate["join"].get("reason", "no_join")
+        checked = None
+        if candidate["join"].get("connected"):
             try:
                 checked = start_at_calculated_entries(_timed_deepcopy(candidate))
-            except ValueError:
-                continue
-            valid, reason = _valid_join(checked["branches"]["right"]["vertices"],
-                checked["branches"]["left"]["vertices"], checked["join"].get("bridge"),
-                checked["contour"], spacing_mm, min_segment_mm)
-            if not guided:
-                # A heading-only completion must retain the paired order.
-                # Extra length from mismatched turns is not spiral coverage.
-                paired = True
-                lv = checked["branches"]["left"]["vertices"]
-                rv = checked["branches"]["right"]["vertices"]
-                for index in range(1, min(len(lv), len(rv))-2):
-                    a, b = lv[index:index+2]
-                    c, d = rv[index:index+2]
-                    u = tuple((b[k]-a[k])/_distance(a, b) for k in (0, 1))
-                    v = tuple((d[k]-c[k])/_distance(c, d) for k in (0, 1))
-                    if (_distance(u, v) > TOLERANCE or
-                            abs(_segment_clearance((a, b), (c, d))-spacing_mm) > TOLERANCE):
-                        paired = False
-                        break
-                if not paired:
-                    continue
-            length = route_length_mm(checked["branches"]) + (
-                _distance(*checked["join"]["bridge"]) if checked["join"].get("bridge") else 0)
-            preserves_boundary = all(actual + TOLERANCE >= required
-                for actual, required in zip(_boundary_coverage(checked, spacing_mm), required_coverage))
-            if valid and preserves_boundary and length > best_length + 2.0 * spacing_mm + TOLERANCE:
-                _record(candidate["journal"], "coverage_completion_selected",
-                        policy="inner_support" if guided else "heading_priority",
-                        previous_length_mm=best_length, length_mm=length)
-                route, best_length = candidate, length
-        return route
-    with timing_scope("fallback"):
-        established = _build_vector_route_once(*(arguments + (False,)))
-        established = _finalize_vector_candidate(established, entry_direction,
-            spacing_mm, offset_mm, min_segment_mm, max_turns, max_rounds, clockwise)
-    if established["join"]["connected"]:
-        try:
-            start_at_calculated_entries(_timed_deepcopy(established))
-        except ValueError:
-            pass
-        else:
-            _record(established["journal"], "contour_route_fallback",
-                    reason=failure)
-            return established
-    return route
+            except ValueError as error:
+                reason = error.args[0] if error.args else "invalid_entry"
+        if checked is None:
+            summary["reason"] = reason
+            if variant == 1:
+                first_failure = reason
+            continue
+        valid, reason = _valid_join(checked["branches"]["right"]["vertices"],
+            checked["branches"]["left"]["vertices"], checked["join"].get("bridge"),
+            checked["contour"], spacing_mm, min_segment_mm)
+        if valid and not guided and best is not None:
+            # Preserve the previous pair-order guard for the heading candidate.
+            # With no valid earlier route it still serves as the old fallback.
+            lv = checked["branches"]["left"]["vertices"]
+            rv = checked["branches"]["right"]["vertices"]
+            for index in range(1, min(len(lv), len(rv))-2):
+                a, b = lv[index:index+2]
+                c, d = rv[index:index+2]
+                u = tuple((b[k]-a[k])/_distance(a, b) for k in (0, 1))
+                v = tuple((d[k]-c[k])/_distance(c, d) for k in (0, 1))
+                if (_distance(u, v) > TOLERANCE or
+                        abs(_segment_clearance((a, b), (c, d))-spacing_mm) > TOLERANCE):
+                    valid, reason = False, "unpaired_heading_route"
+                    break
+        boundary = _boundary_coverage(checked, spacing_mm)
+        if valid and required_boundary is not None and any(
+                actual + TOLERANCE < required
+                for actual, required in zip(boundary, required_boundary)):
+            valid, reason = False, "boundary_coverage_lost"
+        summary["valid"], summary["reason"] = valid, reason
+        if not valid:
+            if variant == 1:
+                first_failure = reason
+            continue
+        length = _total_route_length_mm(checked["branches"], checked["join"])
+        # Measure the geometry that will be drawn, including the configured
+        # length cap. A truncated/disconnected route cannot trigger early exit.
+        displayed = (limit_route_length(checked, max_length_mm)
+                     if max_length_mm is not None else checked)
+        coverage = measure_coverage(displayed, spacing_mm)
+        summary["coverage"], summary["length_mm"] = coverage, length
+        if best is not None and length <= best_length + 2.0 * spacing_mm + TOLERANCE:
+            summary["reason"] = "no_additional_coverage"
+            continue
+        if best is not None:
+            _record(candidate["journal"], "coverage_completion_selected",
+                    policy=policy, previous_length_mm=best_length, length_mm=length)
+        elif variant > 1:
+            _record(candidate["journal"], "contour_route_fallback",
+                    reason=first_failure, policy=policy)
+        best, best_length = candidate, length
+        best_policy, best_variant = policy, variant
+        if required_boundary is None:
+            required_boundary = boundary
+        summary["became_best"] = True
+        if (coverage_threshold is not None and coverage.get("measurable") and
+                coverage["ratio"] >= coverage_threshold and
+                displayed["join"].get("connected") and
+                (max_length_mm is None or length <= max_length_mm + TOLERANCE)):
+            stopped_early = variant < len(variants)
+            summary["early_accept"] = stopped_early
+            if stopped_early:
+                report_stage(u"Покрытие {0:.1f}%: принят вариант {1}".format(
+                    coverage["ratio"] * 100.0, variant), 0.90)
+            break
+    result = best if best is not None else first_attempt
+    for summary in summaries:
+        summary["selected"] = summary["variant"] == best_variant
+    _record(result["journal"], "route_variant_selection",
+            selected_variant=best_variant, selected_policy=best_policy,
+            early_stop=stopped_early, coverage_threshold=coverage_threshold,
+            reason=("sufficient_area_coverage" if stopped_early else
+                    "best_length_with_boundary_coverage" if best is not None else
+                    "no_valid_route"),
+            variant_order=[policy for policy, guided, rebind in variants],
+            attempts=summaries)
+    return result

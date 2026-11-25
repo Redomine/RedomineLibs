@@ -27,26 +27,36 @@ class RouteProfile(object):
     def __init__(self, clock=None):
         self.clock = clock or _clock
         self.nodes = {}
+        self.root_children = {}
+        self.counters = {}
         self.stack = []
         self.previous = None
 
     def enter(self, name):
         started = self.clock()
-        path = (self.stack[-1][0] if self.stack else ()) + (name,)
-        if path not in self.nodes:
-            self.nodes[path] = {"calls": 0, "inclusive_seconds": 0.0,
-                                "self_seconds": 0.0, "max_seconds": 0.0}
-        self.stack.append([path, started, 0.0])
+        parent = self.stack[-1] if self.stack else None
+        siblings = parent[4] if parent is not None else self.root_children
+        entry = siblings.get(name)
+        if entry is None:
+            path = (parent[0] if parent is not None else ()) + (name,)
+            node = {"calls": 0, "inclusive_seconds": 0.0,
+                    "self_seconds": 0.0, "max_seconds": 0.0}
+            children = {}
+            entry = (path, node, children)
+            siblings[name] = entry
+            self.nodes[path] = node
+        path, node, children = entry
+        self.stack.append([path, started, 0.0, node, children])
 
     def leave(self):
         ended = self.clock()
-        path, started, children = self.stack.pop()
+        path, started, children_seconds, node, children = self.stack.pop()
         elapsed = ended - started
-        node = self.nodes[path]
         node["calls"] += 1
         node["inclusive_seconds"] += elapsed
-        node["self_seconds"] += elapsed - children
-        node["max_seconds"] = max(node["max_seconds"], elapsed)
+        node["self_seconds"] += elapsed - children_seconds
+        if elapsed > node["max_seconds"]:
+            node["max_seconds"] = elapsed
         if self.stack:
             self.stack[-1][2] += elapsed
 
@@ -89,6 +99,7 @@ class RouteProfile(object):
         for item in summary:
             item["mean_seconds"] = item["inclusive_seconds"] / item["calls"]
         return {"schema_version": 1, "clock": CLOCK_NAME,
+                "counters": dict(self.counters),
                 "total_seconds": self.nodes[("route",)]["inclusive_seconds"],
                 "accounted_self_seconds": sum(row["self_seconds"] for row in rows),
                 "semantics": "inclusive includes children; sum self_seconds only; "
@@ -126,3 +137,8 @@ def timed(name):
                 profile.leave()
         return measured
     return decorate
+
+
+def record_counters(name, values):
+    if _active is not None:
+        _active.counters[name] = dict(values)

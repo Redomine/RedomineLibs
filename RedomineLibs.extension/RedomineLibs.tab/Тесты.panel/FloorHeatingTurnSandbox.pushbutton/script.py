@@ -31,6 +31,7 @@ COMMAND_DIR = os.path.dirname(os.path.abspath(__file__))
 if COMMAND_DIR not in sys.path:
     sys.path.insert(0, COMMAND_DIR)
 from route_timing import RouteProfile, timing_scope
+from route_coverage import measure_coverage
 from build_progress import BuildProgress, BuildCancelled, checkpoint, report_stage
 from floor_heating_pair import classify_open_ends
 from vector_walk import (arrowhead_segments, build_vector_route,
@@ -327,9 +328,12 @@ def _build_region(document, view, region, selection_method, settings, run_id,
                                        offset_mm=settings["offset_mm"],
                                        spacing_mm=settings["spacing_mm"],
                                        min_segment_mm=minimum_curve_mm,
-                                       clockwise=clockwise)
+                                       clockwise=clockwise,
+                                       max_length_mm=settings["max_length_m"] * 1000.0)
         route = start_at_calculated_entries(route)
-        route = limit_route_length(route, settings["max_length_m"] * 1000.0)
+        route = limit_route_length(route, settings["max_length_m"] * 1000.0,
+                                   include_bridge=settings["algorithm"] == "spiral")
+        route["area_coverage"] = measure_coverage(route, settings["spacing_mm"])
         first_side = ("left" if clockwise else "right") if settings[
             "algorithm"] == "spiral" else ("right" if settings["route_mode"].endswith(
                 "left_to_right") else "left")
