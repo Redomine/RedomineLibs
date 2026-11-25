@@ -1,0 +1,34 @@
+title:
+  ru: RVT в 2024
+  en_us: RVT to 2024
+
+tooltip:
+  ru: >-
+    Пакетно пересохраняет RVT-файлы из обычной папки в Revit 2024. Вложенные папки обрабатываются рекурсивно, их структура сохраняется в целевой папке.
+
+
+    Исходные файлы не изменяются. Существующие файлы в целевой папке не перезаписываются. Резервные копии Revit и файлы более новой версии пропускаются. Файлы Revit 2024 также пересохраняются, чтобы целевая папка содержала полный комплект.
+
+
+    Модели совместной работы открываются с отсоединением и сохраняются как новые центральные модели. Связи не выгружаются и их пути не изменяются. Необработанные файлы и ошибки записываются в JSON-журнал.
+
+
+    1. Запустить команду в Revit 2024.
+
+    2. Выбрать исходную папку с RVT-файлами.
+
+    3. Выбрать другую целевую папку, не вложенную в исходную.
+
+    4. Подтвердить обработку и дождаться итогового отчета.
+  en_us: >-
+    Batch-resaves RVT files from a local or network folder in Revit 2024, preserving the folder hierarchy.
+
+
+    Source files and existing target files are never overwritten. Revit backup files and files from later Revit versions are skipped. Revit 2024 files are resaved as well so the target folder contains the complete set.
+
+
+    Workshared models are opened detached and saved as new central models. Links are not unloaded and link paths are not changed. A JSON report contains skipped files and errors.
+author: Redomine
+context: zero-doc
+min_revit_version: 2024
+max_revit_version: 2024
