@@ -34,7 +34,7 @@ from route_timing import RouteProfile, timing_scope
 from route_coverage import measure_coverage
 from build_progress import BuildProgress, BuildCancelled, checkpoint, report_stage
 from floor_heating_pair import classify_open_ends
-from vector_walk import (arrowhead_segments, build_vector_route,
+from vector_walk import (arrowhead_segments,
                          calculate_start_points, limit_route_length,
                          start_at_calculated_entries)
 from serpentine_walk import build_serpentine_route
@@ -301,9 +301,10 @@ def _build_region(document, view, region, selection_method, settings, run_id,
     if len(ends) != 2:
         raise ValueError("В области требуется ровно два свободных конца труб; найдено: {0}".format(len(ends)))
     right_end, left_end, direction, separation = classify_open_ends(ends)
-    right_start, left_start = calculate_start_points(
-        polygon, right_end["point"], left_end["point"], direction,
-        settings["offset_mm"], settings["spacing_mm"])
+    if settings["algorithm"] != "spiral":
+        right_start, left_start = calculate_start_points(
+            polygon, right_end["point"], left_end["point"], direction,
+            settings["offset_mm"], settings["spacing_mm"])
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
     prepared = time.time()
     with RouteProfile() as route_profile:
@@ -323,17 +324,17 @@ def _build_region(document, view, region, selection_method, settings, run_id,
                     spacing_mm=settings["spacing_mm"],
                     min_segment_mm=minimum_curve_mm)
         else:
-            route = build_vector_route(polygon, right_start,
-                                       left_start, direction, limit,
-                                       offset_mm=settings["offset_mm"],
-                                       spacing_mm=settings["spacing_mm"],
-                                       min_segment_mm=minimum_curve_mm,
-                                       clockwise=clockwise,
-                                       max_length_mm=settings["max_length_m"] * 1000.0)
-        route = start_at_calculated_entries(route)
-        route = limit_route_length(route, settings["max_length_m"] * 1000.0,
-                                   include_bridge=settings["algorithm"] == "spiral")
-        route["area_coverage"] = measure_coverage(route, settings["spacing_mm"])
+            from spiral_native import calculate_spiral
+            def spiral_progress(policy, index):
+                report_stage(u"Расчёт улитки: вариант {0}/3".format(index), (index-1)/3.0)
+            with timing_scope("spiral_csharp"):
+                route, starts = calculate_spiral(polygon, right_end["point"], left_end["point"],
+                                                 direction, settings, minimum_curve_mm, spiral_progress)
+            right_start, left_start = starts["right"], starts["left"]
+        if settings["algorithm"] != "spiral":
+            route = start_at_calculated_entries(route)
+            route = limit_route_length(route, settings["max_length_m"] * 1000.0, include_bridge=False)
+            route["area_coverage"] = measure_coverage(route, settings["spacing_mm"])
         first_side = ("left" if clockwise else "right") if settings[
             "algorithm"] == "spiral" else ("right" if settings["route_mode"].endswith(
                 "left_to_right") else "left")
@@ -401,6 +402,7 @@ def main():
     successes = []
     failures = []
     limited = []
+    timed_out = []
     cancelled = False
     input_cache = {}
     with BuildProgress(len(regions)) as progress:
@@ -411,9 +413,13 @@ def main():
                 progress.region(u"Область {0}/{1}: {2}".format(index+1, len(regions), identifier))
                 data = _build_region(document, view, region, selection_method,
                                      settings, run_id, input_cache)
-                successes.append(identifier)
-                if data["route"]["length_limit_hit"]:
+                route = data["route"]
+                if settings["algorithm"] != "spiral" or route["join"]["connected"]:
+                    successes.append(identifier)
+                if route["length_limit_hit"]:
                     limited.append(identifier)
+                if route.get("time_limit_hit"):
+                    timed_out.append(identifier)
             except BuildCancelled:
                 cancelled = True
                 break
@@ -422,11 +428,14 @@ def main():
                 if settings["save_journal"]:
                     _write_failure_log(run_id, identifier, settings, error)
             progress.finish_region()
-    if len(regions) > 1 or failures or limited or cancelled:
+    if len(regions) > 1 or failures or limited or timed_out or cancelled:
         lines = [u"Областей: {0}; построено: {1}; ошибок: {2}.".format(
             len(regions), len(successes), len(failures))]
         if cancelled:
             lines.append(u"Построение отменено. Текущая область не построена; готовые области сохранены.")
+        if timed_out:
+            lines.append(u"Поиск остановлен по времени: {0}.".format(
+                u", ".join(str(value) for value in timed_out)))
         if limited:
             lines.append(u"Предел длины достигнут: {0}.".format(
                 u", ".join(str(value) for value in limited)))

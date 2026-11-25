@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <Deterministic>true</Deterministic>
+    <NuGetAudit>false</NuGetAudit>
+    <BundleBin>$(MSBuildThisFileDirectory)..\..\RedomineLibs.extension\RedomineLibs.tab\Тесты.panel\FloorHeatingTurnSandbox.pushbutton\bin</BundleBin>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Redomine.FloorHeating.Tests" />
+  </ItemGroup>
+  <Target Name="CopyToPyRevit" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BundleBin)" SkipUnchangedFiles="true"/>
+  </Target>
+</Project>
