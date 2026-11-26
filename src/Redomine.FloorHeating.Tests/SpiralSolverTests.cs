@@ -92,6 +92,56 @@ namespace Redomine.FloorHeating.Tests
         }
 
         [Fact]
+        public void AreaGainMustPayForShorterPassesAlongEachWall()
+        {
+            SpiralRoute Route(double area, params double[] wallLengths) => new SpiralRoute
+            {
+                Connected = true,
+                Coverage = new AreaCoverage
+                {
+                    CoveredAreaMm2 = area,
+                    BoundaryLengthsMm = wallLengths,
+                    StripWidthMm = 200
+                }
+            };
+            var original = Route(1000000, 500, 900);
+            // Losing 100 mm of parallel pipe puts a 100 x 100 mm strip at
+            // stake. Extra pipe along the other wall does not cancel that loss.
+            Assert.False(Search.Better(Route(1005000, 400, 1300), original));
+            Assert.True(Search.Better(Route(1050000, 400, 1300), original));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void SideEntryThroughANarrowWingContinuesIntoTheMainRoom(bool quarterTurn)
+        {
+            const double step = 150;
+            Point2 InView(double x, double y) => quarterTurn
+                ? P(10000 - y * step, -3000 + x * step)
+                : P(x * step, y * step);
+            var request = new SpiralRequest
+            {
+                Polygon = new[] { InView(7, 0), InView(25, 0), InView(25, 18),
+                                  InView(0, 18), InView(0, 12), InView(7, 12) },
+                RightStart = InView(0.5, 15.8),
+                LeftStart = InView(0.5, 17.3),
+                EntryDirection = quarterTurn ? P(0, 1) : P(1, 0),
+                OffsetMm = step,
+                SpacingMm = step,
+                MinimumSegmentMm = 0.8,
+                Clockwise = false
+            };
+            var route = SpiralSolver.Calculate(request);
+            Assert.True(route.Connected);
+            Assert.True(Search.EndsMeet(route.Right.Last(), route.Left.Last(), route.Bridge));
+            var center = InView(16, 9);
+            var sample = new Segment2(center, center);
+            foreach (var branch in new[] { route.Right, route.Left })
+                Assert.Contains(Geometry.Segments(branch), s => Geometry.Clearance(s, sample) <= 2 * step);
+        }
+
+        [Fact]
         public void ConcaveRoomUsesOnlyTheWorkingContourAfterBothInlets()
         {
             var request = Room();

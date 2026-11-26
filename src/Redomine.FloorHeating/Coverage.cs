@@ -187,6 +187,9 @@ namespace Redomine.FloorHeating
                 else
                     AddAbandoned(log, p, bridge);
             }
+            var area = Coverage(rv, lv, bridge);
+            area.BoundaryLengthsMm = BoundaryCoverage(p);
+            area.StripWidthMm = spacing;
             return new SpiralRoute
             {
                 Right = rv.ToArray(),
@@ -205,7 +208,7 @@ namespace Redomine.FloorHeating
                 FullLengthMm = total,
                 Rollback = diagnostics && !clipped ? c.Log.LastOrDefault(e => e.Recovery != null)?.Recovery : null,
                 LengthLimitHit = clipped,
-                Coverage = Coverage(rv, lv, bridge),
+                Coverage = area,
                 Journal = log
             };
         }

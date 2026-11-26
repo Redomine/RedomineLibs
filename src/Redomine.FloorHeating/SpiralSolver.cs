@@ -35,7 +35,9 @@ namespace Redomine.FloorHeating
         private int checks;
         private VariantResult metrics;
         private SpiralRoute safeFinish;
-        private double[] requiredBoundary;
+        private SpiralRoute policyFinish;
+        private Candidate alternateRecovery;
+        private SpiralRoute alternatePreview;
         private bool guardHeading;
         private sealed class SearchExpired : Exception
         {
@@ -53,26 +55,58 @@ namespace Redomine.FloorHeating
                 return true;
             if (a.Connected != b.Connected)
                 return a.Connected;
-            return a.Coverage.CoveredAreaMm2 > b.Coverage.CoveredAreaMm2 + Tol * Tol;
+            double gain = a.Coverage.CoveredAreaMm2 - b.Coverage.CoveredAreaMm2;
+            if (gain <= Tol * Tol)
+                return false;
+            // A pipe on a working-contour edge covers half its strip inside.
+            // A shorter pass along a wall is worthwhile only if the measured
+            // area gained exceeds that half-strip for all shortened passes.
+            double lostLength = 0;
+            var previous = b.Coverage.BoundaryLengthsMm;
+            var next = a.Coverage.BoundaryLengthsMm;
+            for (int i = 0; i < previous.Length; i++)
+                lostLength += Max(0, previous[i] - next[i]);
+            return gain > lostLength * a.Coverage.StripWidthMm / 2 + Tol * Tol;
         }
-        private double[] VisibleBoundary(SpiralRoute r) => BoundaryCoverage(new Pair(
-            new Branch(0, r.Right.ToList(), normal), new Branch(1, r.Left.ToList(), normal)));
         // Keep a directly drawable, independent incumbent before starting more speculative work.
-        private void RememberFinish(Candidate candidate)
+        private void RememberFinish(Candidate candidate, bool considerRefinement = false)
         {
             var shown = Display(candidate, false);
-            if (shown?.Connected != true || !Better(shown, safeFinish) ||
-               (guardHeading && !PairedHeading(shown)) ||
-               (requiredBoundary != null && !Preserves(VisibleBoundary(shown), requiredBoundary)))
+            if (shown?.Connected != true)
                 return;
-            safeFinish = Display(candidate);
-            safeFinish.Policy = metrics.Policy;
+            if (considerRefinement && Better(shown, alternatePreview))
+            {
+                alternatePreview = shown;
+                alternateRecovery = candidate.Clone();
+            }
+            if (guardHeading && !PairedHeading(shown))
+                return;
+            KeepOuterPass(shown);
+            if (!Better(shown, policyFinish))
+                return;
+            policyFinish = Display(candidate);
+            SaveForTimeout(policyFinish);
+        }
+        private void SaveForTimeout(SpiralRoute route)
+        {
+            route.Policy = metrics.Policy;
+            if (route.Connected && Better(route, safeFinish))
+                safeFinish = route;
+        }
+        private SpiralRoute ConsiderFinish(SpiralRoute current, SpiralRoute proposed)
+        {
+            if (proposed == null || (guardHeading && !PairedHeading(proposed)))
+                return current;
+            KeepOuterPass(proposed);
+            SaveForTimeout(proposed);
+            var result = Better(proposed, current) ? RestoreBoundary(proposed, current) : RestoreBoundary(current, proposed);
+            SaveForTimeout(result);
+            return result;
         }
         internal SpiralRoute Calculate(Stopwatch timer, Action<string, int> progress)
         {
             clock = timer;
             SpiralRoute best = null;
-            double[] required = null;
             var attempts = new List<VariantResult>();
             bool timedOut = false;
             var policies = new[] { "contour_progress", "heading_priority", "inner_support" };
@@ -81,48 +115,42 @@ namespace Redomine.FloorHeating
                 metrics = new VariantResult { Policy = policies[index] };
                 attempts.Add(metrics);
                 guardHeading = index == 1 && best?.Connected == true;
-                requiredBoundary = best?.Connected == true ? required : null;
+                alternateRecovery = null;
+                alternatePreview = null;
+                policyFinish = null;
                 var started = clock.Elapsed;
                 try
                 {
                     Poll(true);
                     progress?.Invoke(metrics.Policy, index + 1);
                     var candidate = Build(index != 1, index == 2);
-                    if (candidate?.Join == null)
-                    {
-                        metrics.Reason = "no_valid_orthogonal_join";
-                        continue;
-                    }
-                    candidate = FinalizeCandidate(candidate);
-                    var result = Display(candidate);
+                    var primary = candidate?.Join == null ? null : Display(FinalizeCandidate(candidate));
+                    var result = ConsiderFinish(null, primary);
+                    if (alternateRecovery != null)
+                        result = ConsiderFinish(result, Display(FinalizeCandidate(alternateRecovery)));
+                    result = ConsiderFinish(result, policyFinish);
                     if (result == null)
                     {
-                        metrics.Reason = "invalid_visible_geometry";
+                        if (primary != null)
+                        {
+                            metrics.Record(primary);
+                            metrics.Reason = "unpaired_heading_route";
+                        }
+                        else
+                            metrics.Reason = candidate?.Join == null ? "no_valid_orthogonal_join" : "invalid_visible_geometry";
                         continue;
                     }
-                    result.Policy = metrics.Policy;
-                    metrics.Connected = result.Connected;
-                    metrics.Coverage = result.Coverage;
-                    metrics.LengthMm = result.LengthMm;
-                    metrics.FullLengthMm = result.FullLengthMm;
-                    if (guardHeading && !PairedHeading(result))
-                    {
-                        metrics.Reason = "unpaired_heading_route";
-                        continue;
-                    }
-                    var boundary = VisibleBoundary(result);
-                    if (best != null && best.Connected == result.Connected && required != null && !Preserves(boundary, required))
-                    {
-                        metrics.Reason = "boundary_coverage_lost";
-                        continue;
-                    }
+                    result = RestoreBoundary(result, best);
+                    if (result.Connected && outerPasses.TryGetValue((result.Right[0], result.Left[0]), out var outer))
+                        result = RestoreBoundary(result, outer);
+                    metrics.Record(result);
                     if (!Better(result, best))
                     {
-                        metrics.Reason = "no_additional_coverage";
+                        metrics.Reason = best != null && result.Connected == best.Connected &&
+                            result.Coverage.CoveredAreaMm2 > best.Coverage.CoveredAreaMm2 + Tol * Tol
+                            ? "boundary_strip_loss" : "no_additional_coverage";
                         continue;
                     }
-                    if (best == null || best.Connected != result.Connected)
-                        required = boundary;
                     best = result;
                     if (result.Connected && result.Coverage.Ratio >= 0.95)
                         break;
@@ -130,15 +158,11 @@ namespace Redomine.FloorHeating
                 catch (SearchExpired) { timedOut = true; metrics.Reason = "time_limit"; break; }
                 finally { metrics.Seconds = (clock.Elapsed - started).TotalSeconds; }
             }
-            if (Better(safeFinish, best) && (best?.Connected != true || required == null ||
-                                            Preserves(VisibleBoundary(safeFinish), required)))
+            if (Better(safeFinish, best))
             {
                 best = safeFinish;
                 var saved = attempts.Find(a => a.Policy == best.Policy);
-                saved.Connected = true;
-                saved.LengthMm = best.LengthMm;
-                saved.FullLengthMm = best.FullLengthMm;
-                saved.Coverage = best.Coverage;
+                saved.Record(best);
                 saved.Reason = timedOut ? "time_limit_saved_finish" : "saved_connected_finish";
             }
             if (timedOut && best?.Connected != true)

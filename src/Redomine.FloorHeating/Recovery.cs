@@ -13,6 +13,7 @@ namespace Redomine.FloorHeating
             internal Pair Pair, Source;
             internal int Round;
             internal Turn Turn;
+            internal bool RevisitedLeader;
             internal List<SpiralEvent> Log;
             internal SpiralEvent Event;
             internal Recovery(Pair pair, Pair source, int round, Turn turn, List<SpiralEvent> log,
@@ -223,10 +224,45 @@ namespace Redomine.FloorHeating
             return new Recovery(t, p, round, Turn.Forward, log, "pair_forward_recovery",
                                 new RecoveryDetail { Reason = "paired_forward_recovery" });
         }
+        private IEnumerable<Recovery> VertexRecoveries(Pair p, int round, Direction d, List<Turn?> followers,
+                                                       bool requireJoin, bool revisited)
+        {
+            var lead = p[first].Clone();
+            lead.Stop = null;
+            lead.Pending = lead.Only = d.Turn;
+            var leadLog = new List<SpiralEvent>();
+            var partner = Obstacles(p[second]);
+            if (Walk(lead, partner, leadLog, round + 1) != d.Turn)
+                yield break;
+            var reserve = Reservation(lead, partner);
+            var obstacles = Obstacles(lead);
+            AddReservation(obstacles, reserve);
+            var seenFollowers = new List<Branch>();
+            foreach (var turn in followers)
+            {
+                var follow = p[second].Clone();
+                follow.Stop = null;
+                if (turn.HasValue)
+                    follow.Only = turn;
+                var log = new List<SpiralEvent>(leadLog);
+                if (!Walk(follow, obstacles, log, round + 1).HasValue ||
+                    seenFollowers.Any(previous => previous.SameState(follow)))
+                    continue;
+                seenFollowers.Add(follow.Clone());
+                var t = first == 0 ? new Pair(lead.Clone(), follow) : new Pair(follow, lead.Clone());
+                if (!requireJoin || Finish(t, false) != null)
+                    yield return new Recovery(t, p, round, d.Turn, log, "pair_vertex_recovery", new RecoveryDetail
+                    {
+                        Reason = "paired_vertex_recovery", PartnerTurn = turn.HasValue ? TurnName(turn.Value) : null
+                    }) { RevisitedLeader = revisited };
+            }
+        }
+
         private IEnumerable<Recovery> Recoveries(List<(int round, Pair pair)> snapshots, List<SpiralEvent> history,
                                                 bool requireJoin, HashSet<int> exhausted = null)
         {
-            var rejected = new HashSet<(int, string)>(history.Where(e => e.Action == "segment" && e.Branch == SideName(first))
+            var deferred = new List<IEnumerable<Recovery>>();
+            var previousTurns = new HashSet<(int, string)>(history.Where(e => e.Action == "segment" && e.Branch == SideName(first))
                                                    .Select(e => (e.Round, e.Choice)));
             for (int i = snapshots.Count - 1; i >= 0; i--)
             {
@@ -239,36 +275,17 @@ namespace Redomine.FloorHeating
                 var directions = Directions(a);
                 var followers = Directions(b).Select(x => (Turn?)x.Turn).ToList();
                 followers.Insert(0, null);
+                // Repeating the leader's turn can give the follower a different
+                // exit. Try new lead turns first, then compare actual states.
                 foreach (var d in directions)
                 {
-                    if (rejected.Contains((round + 1, TurnName(d.Turn))))
-                        continue;
-                    var lead = a.Clone();
-                    lead.Stop = null;
-                    lead.Pending = lead.Only = d.Turn;
-                    var leadLog = new List<SpiralEvent>();
-                    var partner = Obstacles(b);
-                    if (Walk(lead, partner, leadLog, round + 1) != d.Turn)
-                        continue;
-                    var reserve = Reservation(lead, partner);
-                    var obstacles = Obstacles(lead);
-                    AddReservation(obstacles, reserve);
-                    foreach (var turn in followers)
+                    if (previousTurns.Contains((round + 1, TurnName(d.Turn))))
                     {
-                        var follow = b.Clone();
-                        follow.Stop = null;
-                        if (turn.HasValue)
-                            follow.Only = turn;
-                        var log = new List<SpiralEvent>(leadLog);
-                        if (!Walk(follow, obstacles, log, round + 1).HasValue)
-                            continue;
-                        var t = first == 0 ? new Pair(lead.Clone(), follow) : new Pair(follow, lead.Clone());
-                        if (!requireJoin || Finish(t, false) != null)
-                            yield return new Recovery(t, p, round, d.Turn, log, "pair_vertex_recovery", new RecoveryDetail
-                            {
-                                Reason = "paired_vertex_recovery", PartnerTurn = turn.HasValue ? TurnName(turn.Value) : null
-                            });
+                        deferred.Add(VertexRecoveries(p.Clone(), round, d, followers, requireJoin, true));
+                        continue;
                     }
+                    foreach (var recovery in VertexRecoveries(p, round, d, followers, requireJoin, false))
+                        yield return recovery;
                 }
                 var points = (a.Segments.Count > 0 && b.Segments.Count > 0 && Max(a.Turns, b.Turns) < maxTurns && a.Heading.Near(b.Heading))
                     ? RecoveryPoints(p, directions) : null;
@@ -288,6 +305,9 @@ namespace Redomine.FloorHeating
                 }
                 exhausted?.Add(round);
             }
+            foreach (var alternatives in deferred)
+                foreach (var recovery in alternatives)
+                    yield return recovery;
         }
         private void AddRecoveryLog(List<SpiralEvent> target, Recovery recovery)
         {
@@ -364,12 +384,14 @@ namespace Redomine.FloorHeating
                 var log = new List<SpiralEvent>(history);
                 AddRecoveryLog(log, recovery);
                 var c = Continue(t, log, start, false, new Budget(maxRounds));
-                if (c.Join == null || !Clear(c.Pair.Right.Vertices, c.Pair.Left.Vertices, c.Join.Bridge) ||
-                   !Preserves(BoundaryCoverage(c.Pair), boundary))
+                if (c.Join == null || !Clear(c.Pair.Right.Vertices, c.Pair.Left.Vertices, c.Join.Bridge))
                     continue;
-                // A shorter recovery may close within the user's length limit even
-                // when a longer continuation is preferred for further growth.
-                RememberFinish(c);
+                // This prefix guides growth, but may never close. Keep a viable
+                // alternative before deciding which perimeter passes to extend.
+                bool growthSeed = !recovery.RevisitedLeader && Preserves(BoundaryCoverage(c.Pair), boundary);
+                RememberFinish(c, considerRefinement: !growthSeed);
+                if (!growthSeed)
+                    continue;
                 double length = Normalized(c);
                 if (length > bestLength + Tol)
                 {

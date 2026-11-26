@@ -95,6 +95,10 @@ namespace Redomine.FloorHeating
 
     public sealed class AreaCoverage
     {
+        // For ranking completed routes on the same contour. Each edge is kept
+        // separately so a gain along one wall cannot hide a loss along another.
+        internal double[] BoundaryLengthsMm { get; set; } = Array.Empty<double>();
+        internal double StripWidthMm { get; set; }
         public double WorkingAreaMm2
         {
             get; internal set;
@@ -108,6 +112,13 @@ namespace Redomine.FloorHeating
 
     public sealed class VariantResult
     {
+        internal void Record(SpiralRoute route)
+        {
+            Connected = route.Connected;
+            Coverage = route.Coverage;
+            LengthMm = route.LengthMm;
+            FullLengthMm = route.FullLengthMm;
+        }
         public string Policy
         {
             get; internal set;
