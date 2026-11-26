@@ -141,6 +141,115 @@ namespace Redomine.FloorHeating.Tests
                 Assert.Contains(Geometry.Segments(branch), s => Geometry.Clearance(s, sample) <= 2 * step);
         }
 
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        [InlineData(true, true)]
+        public void RecoveryFollowsTheReentrantCornerOnSuccessiveLaps(bool mirrored, bool sideEntry)
+        {
+            const double step = 150;
+            Point2 InView(double x, double y) => mirrored
+                ? P(12000 + y * step, -4500 + x * step) : P(x * step, y * step);
+            var right = sideEntry ? InView(0.4, 1.5) : InView(12, 0.4);
+            var left = sideEntry ? InView(0.4, 2.5) : InView(11, 0.4);
+            var incoming = mirrored ? P(1, 0) : P(0, 1);
+            var outgoing = mirrored ? P(0, 1) : P(1, 0);
+            var route = SpiralSolver.Calculate(new SpiralRequest
+            {
+                Polygon = new[] { InView(0, 0), InView(13, 0), InView(13, 22),
+                                  InView(29, 22), InView(29, 37), InView(0, 37) },
+                RightStart = mirrored ? left : right,
+                LeftStart = mirrored ? right : left,
+                EntryDirection = sideEntry ? outgoing : incoming,
+                Clockwise = mirrored,
+                SpacingMm = step, OffsetMm = step, MinimumSegmentMm = 0.8, MaximumLengthMm = 125000
+            });
+
+            Assert.True(route.Connected);
+            for (int inset = 0; inset < 6; inset++)
+            {
+                var branch = (inset % 2 == 0) != mirrored ? route.Right : route.Left;
+                var corner = InView(12 - inset, 23 + inset);
+                Assert.Contains(Enumerable.Range(1, branch.Length - 2), i =>
+                    branch[i].Near(corner) &&
+                    new Segment2(branch[i - 1], branch[i]).Unit.Near(incoming) &&
+                    new Segment2(branch[i], branch[i + 1]).Unit.Near(outgoing));
+            }
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ARealWallProjectionOnePitchDeepKeepsItsPass(bool clockwise)
+        {
+            const double step = 175;
+            Point2 Grid(double x, double y) => P(x * step, y * step);
+            var route = SpiralSolver.Calculate(new SpiralRequest
+            {
+                Polygon = new[] { Grid(0, 0), Grid(24, 0), Grid(24, 16), Grid(15, 16),
+                                  Grid(15, 17), Grid(8, 17), Grid(8, 16), Grid(0, 16) },
+                RightStart = Grid(11, 0.5), LeftStart = Grid(10, 0.5), EntryDirection = P(0, 1),
+                Clockwise = clockwise,
+                SpacingMm = step, OffsetMm = step, MinimumSegmentMm = 0.8, MaximumLengthMm = 125000
+            });
+
+            Assert.True(route.Connected);
+            var outer = clockwise ? route.Left : route.Right;
+            Assert.Contains(Geometry.Segments(outer), s => s.Horizontal &&
+                Geometry.On(Grid(10, 16), s) && Geometry.On(Grid(13, 16), s));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void StaggeredBranchesTakeTheSameFreeInteriorBend(bool mirrored)
+        {
+            const double pitch = 160;
+            Point2 Grid(double x, double y) => mirrored ? P(-y * pitch, -x * pitch) : P(x * pitch, y * pitch);
+            var route = SpiralSolver.Calculate(new SpiralRequest
+            {
+                Polygon = new[] { Grid(0, 0), Grid(12, 0), Grid(12, 23), Grid(26, 23), Grid(26, 35), Grid(0, 35) },
+                RightStart = Grid(0.5, mirrored ? 19.25 : 18.25),
+                LeftStart = Grid(0.5, mirrored ? 18.25 : 19.25),
+                EntryDirection = mirrored ? P(0, -1) : P(1, 0), Clockwise = !mirrored,
+                SpacingMm = pitch, OffsetMm = pitch, MinimumSegmentMm = 0.8, MaximumLengthMm = 80000
+            });
+
+            Assert.True(route.Connected);
+            // Even when the leader has finished its next leg, both passes
+            // through the neck must continue into the upper arm.
+            var inner = mirrored ? route.Left : route.Right;
+            var outer = mirrored ? route.Right : route.Left;
+            Assert.Contains(Geometry.Segments(inner), s => Geometry.On(Grid(6, 18), s) && Geometry.On(Grid(6, 25), s));
+            Assert.Contains(Geometry.Segments(outer), s => Geometry.On(Grid(5, 18), s) && Geometry.On(Grid(5, 25), s));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void OffGridPipeCheckpointKeepsBothPassesStraightOutOfAWing(bool mirrored)
+        {
+            const double pitch = 160;
+            Point2 Grid(double x, double y) => mirrored ? P(-x * pitch, y * pitch) : P(x * pitch, y * pitch);
+            var route = SpiralSolver.Calculate(new SpiralRequest
+            {
+                Polygon = new[] { Grid(0, 0), Grid(18, 0), Grid(18, 8.5), Grid(23, 8.5), Grid(23, 17.5),
+                                  Grid(18, 17.5), Grid(18, 25), Grid(15.25, 25), Grid(15.25, 30),
+                                  Grid(4.5, 30), Grid(4.5, 25), Grid(0, 25) },
+                RightStart = Grid(0.5, mirrored ? 23.75 : 22.75),
+                LeftStart = Grid(0.5, mirrored ? 22.75 : 23.75),
+                EntryDirection = mirrored ? P(-1, 0) : P(1, 0), Clockwise = !mirrored,
+                SpacingMm = pitch, OffsetMm = pitch, MinimumSegmentMm = 0.8, MaximumLengthMm = 80000
+            });
+
+            Assert.True(route.Connected);
+            var inner = mirrored ? route.Left : route.Right;
+            var outer = mirrored ? route.Right : route.Left;
+            Assert.Contains(Geometry.Segments(inner), s => Geometry.On(Grid(11.25, 25), s) && Geometry.On(Grid(11.25, 22.25), s));
+            Assert.Contains(Geometry.Segments(outer), s => Geometry.On(Grid(12.25, 25), s) && Geometry.On(Grid(12.25, 22.25), s));
+        }
+
         [Fact]
         public void ConcaveRoomUsesOnlyTheWorkingContourAfterBothInlets()
         {

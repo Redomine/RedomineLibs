@@ -110,6 +110,8 @@ def calculate_spiral(polygon, right_inlet, left_inlet, normal, settings, minimum
             item["round"] = event.Round
         if event.Recovery is not None:
             item.update(_recovery(event.Recovery))
+        elif event.Action.endswith(("offset_corner_straightened", "offset_run_straightened")):
+            item.update(at=_point(event.Origin), removed_segment=_segment(event.Segment))
         elif event.Action.endswith("direction_probe"):
             item.update(at=_point(event.Origin), candidate=event.Choice, result={
                 "direction": _point(event.Direction), "available_mm": event.AvailableMm,

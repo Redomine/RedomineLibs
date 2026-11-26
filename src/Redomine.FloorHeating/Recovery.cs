@@ -76,6 +76,8 @@ namespace Redomine.FloorHeating
             if (!leader.HasValue && !always)
                 return (leader, null);
             var follower = Walk(p[second], reserve ? FollowerObstacles(p, extras) : Obstacles(p[first]), log, round);
+            if (leader.HasValue || follower.HasValue)
+                AlignOffsetCorners(p, null, final: false, tipsOnly: true, log: log);
             return (leader, follower);
         }
         private bool Tight(Pair p)
@@ -341,6 +343,7 @@ namespace Redomine.FloorHeating
                 if (c?.Join == null)
                     return -1;
                 var copy = new Candidate(c.Pair.Clone(), c.Join, new List<SpiralEvent>());
+                AlignOffsetCorners(copy.Pair, copy.Join.Bridge, final: true, tipsOnly: false, log: null);
                 Simplify(copy);
                 return Length(copy.Pair, copy.Join);
             }

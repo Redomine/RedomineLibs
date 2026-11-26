@@ -139,6 +139,8 @@ namespace Redomine.FloorHeating
                     visible[1] += normal.Right * shift;
                 b.SetPath(visible);
             }
+            var log = diagnostics ? new List<SpiralEvent>(c.Log) : null;
+            AlignOffsetCorners(p, c.Join.Bridge, final: true, tipsOnly: false, log: log);
             if (!Clear(p.Right.Vertices, p.Left.Vertices, c.Join.Bridge, true) || Max(p.Right.Turns, p.Left.Turns) > maxTurns)
                 return null;
             double total = Length(p, c.Join);
@@ -179,7 +181,6 @@ namespace Redomine.FloorHeating
                 p.Left.SetPath(lv);
             }
             var bridge = clipped ? null : c.Join.Bridge;
-            var log = diagnostics ? new List<SpiralEvent>(c.Log) : null;
             if (diagnostics)
             {
                 if (clipped)

@@ -290,6 +290,8 @@ namespace Redomine.FloorHeating
             var fallback = route;
             if (Display(route, false) == null)
                 return route;
+            route = route.Clone();
+            AlignOffsetCorners(route.Pair, route.Join.Bridge, final: true, tipsOnly: false, log: route.Log);
             route = EntryBypass(InwardBypass(route));
             var simplified = route.Clone();
             Simplify(simplified);

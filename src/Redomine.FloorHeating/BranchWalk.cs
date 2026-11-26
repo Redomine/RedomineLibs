@@ -78,6 +78,37 @@ namespace Redomine.FloorHeating
         private List<Direction> SampleDirections(Branch branch, Point2 sample, Point2 heading, ref Anchor? anchor) =>
             Directions(sample, heading, branch.Guided, branch.Rebind, ref anchor, branch.Reserve);
 
+        private bool LeavesPairedBend(Branch branch, Point2 direction, List<Obstacle> other, List<Direction> choices)
+        {
+            if (branch.Segments.Count == 0)
+                return false;
+            var prior = branch.Segments[branch.Segments.Count - 1];
+            if (!prior.Unit.Near(branch.Heading))
+                return false;
+            var expected = -direction;
+            var bend = PartnerCorner(branch.Side, branch.Tip, branch.Heading, expected);
+            int axis = prior.Horizontal ? 0 : 1;
+            for (int i = other.Count - 2; i >= 0; i--)
+            {
+                var a = other[i];
+                var b = other[i + 1];
+                if (a.Kind != Blocker.Other || b.Kind != Blocker.Other || !a.Segment.End.Near(bend) ||
+                    !a.Segment.Unit.Near(branch.Heading) || !b.Segment.Unit.Near(expected) ||
+                    Min(High(prior, axis), High(a.Segment, axis)) <= Max(Low(prior, axis), Low(a.Segment, axis)) + Tol)
+                    continue;
+                // A narrow wall projection can accommodate only the outer
+                // branch. Let either branch follow the perimeter independently.
+                if (Array.Exists(edges, wall => On(bend, wall) || On(branch.Tip, wall)) ||
+                    !choices.Any(d => d.Vector.Near(expected)))
+                    return false;
+                // The other branch has already rounded this very corner. A
+                // forced opposite turn would send the branches into different arms.
+                var paired = Probe(branch.Tip, expected, branch.Segments, other);
+                return CanTravel(paired) && paired.Available >= spacing - Tol;
+            }
+            return false;
+        }
+
         private Turn? Walk(Branch b, List<Obstacle> other, List<SpiralEvent> log, int round, double minimumTurnRun = 0)
         {
             if (b.Stop != null)
@@ -105,6 +136,8 @@ namespace Redomine.FloorHeating
             }
             Point2? tangent = b.Guided && b.Anchor.HasValue ? tangents[b.Anchor.Value.Edge] : (Point2?)null;
             bool blockedTangent = false;
+            var requested = b.Only ?? b.Pending;
+            var ordinaryChoices = choices;
             if (b.Pending.HasValue)
             {
                 choices = choices.OrderBy(d => d.Turn != b.Pending).ToList();
@@ -135,6 +168,8 @@ namespace Redomine.FloorHeating
                         blockedTangent = true;
                     continue;
                 }
+                if (turn != Turn.Forward && turn == requested && LeavesPairedBend(b, direction, other, ordinaryChoices))
+                    continue;
                 double travel = ray.Available, fallbackDistance = 0;
                 Turn? fallback = null;
                 bool chosen = false;

@@ -12,6 +12,7 @@ namespace Redomine.FloorHeating
         private readonly Point2[] polygon, contour;
         private readonly Segment2[] edges;
         private readonly Point2[] tangents;
+        private readonly int[] reflexEdges;
         private readonly double[] phases, edgeLengths;
         private readonly double spacing, offset, minimum, maximumLength;
         private readonly int first, second, maxTurns, maxRounds;
@@ -42,6 +43,8 @@ namespace Redomine.FloorHeating
             var ordered = (SignedArea(contour) < 0) == clockwise ? contour : contour.Reverse().ToArray();
             edges = Segments(ordered, true).ToArray();
             tangents = edges.Select(s => s.Unit).ToArray();
+            reflexEdges = Enumerable.Range(0, edges.Length).Where(i =>
+                (clockwise ? 1 : -1) * tangents[i].Cross(tangents[Next(i)]) > Tol).ToArray();
             edgeLengths = edges.Select(s => s.Length).ToArray();
             phases = new double[edges.Length];
             for (int i = 1; i < edges.Length; i++)
