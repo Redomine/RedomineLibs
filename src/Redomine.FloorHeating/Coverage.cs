@@ -36,15 +36,32 @@ namespace Redomine.FloorHeating
         private double[] BoundaryCoverage(Pair pair)
         {
             var branches = pair.Right.Segments.Concat(pair.Left.Segments).ToArray();
+            double reach = offset == 0 ? Tol : spacing / 2 + Tol;
             return Segments(contour, true).Select(edge =>
             {
                 int axis = edge.Horizontal ? 0 : 1, cross = 1 - axis;
                 var intervals = new List<(double, double)>();
                 foreach (var s in branches)
-                    if (Abs(s.Delta[cross]) <= Tol && Abs(s.Start[cross] - edge.Start[cross]) <= spacing / 2 + Tol)
+                    if (Abs(s.Delta[cross]) <= Tol && Abs(s.Start[cross] - edge.Start[cross]) <= reach)
                         intervals.Add((Max(Low(edge, axis), Low(s, axis)), Min(High(edge, axis), High(s, axis))));
                 return Union(intervals).Sum(x => x.hi - x.lo);
             }).ToArray();
+        }
+        private double OuterPass(Branch outer)
+        {
+            if (outer.Segments.Count == 0)
+                return 0;
+            int edge = OutgoingEdge(outer.Vertices[0]);
+            double length = 0;
+            foreach (var s in outer.Segments)
+            {
+                if (edge < 0 || !s.Unit.Near(tangents[edge]) || !On(s.End, edges[edge]))
+                    break;
+                length += s.Length;
+                if (s.End.Near(edges[edge].End))
+                    edge = Next(edge);
+            }
+            return length;
         }
         private AreaCoverage Coverage(IReadOnlyList<Point2> right, IReadOnlyList<Point2> left, Segment2? bridge)
         {
@@ -102,12 +119,17 @@ namespace Redomine.FloorHeating
         {
             if (c?.Join == null)
                 return null;
+            var rightEntry = c.Log.FirstOrDefault(e => e.Action == "entry" && e.Branch == "right");
+            var leftEntry = c.Log.FirstOrDefault(e => e.Action == "entry" && e.Branch == "left");
+            if (rightEntry == null || leftEntry == null)
+                return null;
+            var starts = Starts(rightEntry.Segment.Start, leftEntry.Segment.Start, normal, polygon, offset, spacing);
             var p = c.Pair.Clone();
             for (int side = 0; side < 2; side++)
             {
                 var b = p[side];
-                var entry = c.Log.FirstOrDefault(e => e.Action == "entry" && e.Branch == SideName(side));
-                if (entry == null || b.Vertices.Count < 2)
+                var entry = side == 0 ? rightEntry : leftEntry;
+                if (b.Vertices.Count < 2)
                     return null;
                 var start = entry.Segment.Start;
                 var corrected = entry.Segment.End;
@@ -126,12 +148,9 @@ namespace Redomine.FloorHeating
                         visible.Insert(0, corrected);
                     }
                 }
-                double back = Boundary(visible[0], -normal, polygon);
-                if (back > Tol)
-                    visible.Insert(0, visible[0] - normal * back);
-                var leftEntry = c.Log.First(e => e.Action == "entry" && e.Branch == "left");
-                var rightEntry = c.Log.First(e => e.Action == "entry" && e.Branch == "right");
-                var starts = Starts(rightEntry.Segment.Start, leftEntry.Segment.Start, normal, polygon, offset, spacing);
+                var foot = Entry(visible[0], normal, 0, polygon);
+                if (!visible[0].Near(foot))
+                    visible.Insert(0, foot);
                 var target = side == 0 ? starts.right : starts.left;
                 double shift = (target - visible[0]).Dot(normal.Right);
                 visible[0] = target;
@@ -190,6 +209,8 @@ namespace Redomine.FloorHeating
             }
             var area = Coverage(rv, lv, bridge);
             area.BoundaryLengthsMm = BoundaryCoverage(p);
+            if (offset == 0)
+                area.OuterPassMm = OuterPass(p[first]);
             area.StripWidthMm = spacing;
             return new SpiralRoute
             {

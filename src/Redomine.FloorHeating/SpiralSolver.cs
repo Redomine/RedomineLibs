@@ -11,7 +11,9 @@ namespace Redomine.FloorHeating
     {
         /// <summary>Build, validate, cap and score a two-branch spiral in view-plane millimetres.</summary>
         public static SpiralRoute Calculate(SpiralRequest request) => Calculate(request, null);
-        public static SpiralRoute Calculate(SpiralRequest request, Action<string, int> progress)
+        public static SpiralRoute Calculate(SpiralRequest request, Action<string, int> progress) =>
+            Calculate(request, progress, null);
+        public static SpiralRoute Calculate(SpiralRequest request, Action<string, int> progress, Action checkpoint)
         {
             var clock = Stopwatch.StartNew();
             if (request == null || request.Polygon == null)
@@ -26,13 +28,16 @@ namespace Redomine.FloorHeating
             var n = request.EntryDirection;
             if (!(Abs(n.X) == 1 && n.Y == 0 || Abs(n.Y) == 1 && n.X == 0))
                 throw new ArgumentException("entry_direction_must_be_orthogonal_unit_vector");
-            return new Search(request).Calculate(clock, progress);
+            return new Search(request).Calculate(clock, progress, checkpoint);
         }
     }
     internal sealed partial class Search
     {
         private Stopwatch clock;
         private int checks;
+        private Action checkpoint;
+        private TimeSpan nextCheckpoint;
+        private static readonly TimeSpan CheckpointInterval = TimeSpan.FromMilliseconds(200);
         private VariantResult metrics;
         private SpiralRoute safeFinish;
         private SpiralRoute policyFinish;
@@ -44,8 +49,16 @@ namespace Redomine.FloorHeating
         }
         private void Poll(bool force = false)
         {
-            if ((force || (++checks & 127) == 0) && clock.Elapsed >= timeBudget)
+            if (!force && (++checks & 127) != 0)
+                return;
+            var elapsed = clock.Elapsed;
+            if (elapsed >= timeBudget)
                 throw new SearchExpired();
+            if (checkpoint != null && elapsed >= nextCheckpoint)
+            {
+                nextCheckpoint = elapsed + CheckpointInterval;
+                checkpoint();
+            }
         }
         internal static bool Better(SpiralRoute a, SpiralRoute b)
         {
@@ -55,6 +68,15 @@ namespace Redomine.FloorHeating
                 return true;
             if (a.Connected != b.Connected)
                 return a.Connected;
+            if (a.Coverage.OuterPassMm.HasValue && b.Coverage.OuterPassMm.HasValue)
+            {
+                double passGain = a.Coverage.OuterPassMm.Value - b.Coverage.OuterPassMm.Value;
+                if (Abs(passGain) > Tol)
+                    return passGain > 0;
+                double perimeterGain = a.Coverage.BoundaryLengthsMm.Sum() - b.Coverage.BoundaryLengthsMm.Sum();
+                if (Abs(perimeterGain) > Tol)
+                    return perimeterGain > 0;
+            }
             double gain = a.Coverage.CoveredAreaMm2 - b.Coverage.CoveredAreaMm2;
             if (gain <= Tol * Tol)
                 return false;
@@ -103,9 +125,10 @@ namespace Redomine.FloorHeating
             SaveForTimeout(result);
             return result;
         }
-        internal SpiralRoute Calculate(Stopwatch timer, Action<string, int> progress)
+        internal SpiralRoute Calculate(Stopwatch timer, Action<string, int> progress, Action checkpoint)
         {
             clock = timer;
+            this.checkpoint = checkpoint;
             SpiralRoute best = null;
             var attempts = new List<VariantResult>();
             bool timedOut = false;
@@ -152,7 +175,7 @@ namespace Redomine.FloorHeating
                         continue;
                     }
                     best = result;
-                    if (result.Connected && result.Coverage.Ratio >= 0.95)
+                    if (offset > 0 && result.Connected && result.Coverage.Ratio >= 0.95)
                         break;
                 }
                 catch (SearchExpired) { timedOut = true; metrics.Reason = "time_limit"; break; }
@@ -221,7 +244,7 @@ namespace Redomine.FloorHeating
         {
             var starts = new[] { rightStart, leftStart };
             var targets = EntryTargets(starts);
-            if (guided)
+            if (guided && offset > 0)
             {
                 var a = Project(targets[first]);
                 var tangent = tangents[a.Edge];

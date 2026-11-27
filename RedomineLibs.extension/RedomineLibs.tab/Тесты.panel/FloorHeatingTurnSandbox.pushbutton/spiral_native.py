@@ -9,6 +9,7 @@ import tempfile
 import clr
 from System import Action, Array, Int32, String
 from System.Reflection import Assembly
+from build_progress import checkpoint
 
 _types = {}
 
@@ -95,7 +96,7 @@ def calculate_spiral(polygon, right_inlet, left_inlet, normal, settings, minimum
     request.MaximumLengthMm = settings["max_length_m"] * 1000.0
     request.Clockwise = settings["clockwise"]
     callback = Action[String, Int32](progress) if progress is not None else None
-    result = solver.Calculate(request, callback)
+    result = solver.Calculate(request, callback, Action(checkpoint) if progress is not None else None)
     starts = {"right": _point(result.RightStart), "left": _point(result.LeftStart)}
     journal = [{"step": 1, "action": "input", "polygon": [list(p) for p in polygon],
                 "right_start": starts["right"], "left_start": starts["left"], "entry_direction": list(normal),

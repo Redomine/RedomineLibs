@@ -120,6 +120,18 @@ namespace Redomine.FloorHeating
             }
             var point = b.Tip;
             var choices = Directions(b);
+            int wall = -1;
+            if (offset == 0 && b.Side == first && b.Guided)
+            {
+                wall = OutgoingEdge(point);
+                if (wall >= 0)
+                {
+                    var along = tangents[wall];
+                    if (!choices.Any(d => d.Vector.Near(along)))
+                        choices.AddRange(Ordinary(b.Heading, clockwise).Where(d => d.Vector.Near(along)));
+                    choices = choices.OrderByDescending(d => d.Vector.Near(along)).ToList();
+                }
+            }
             var probes = new Dictionary<Turn, ProbeResult>();
             if (b.Guided)
             {
@@ -170,10 +182,14 @@ namespace Redomine.FloorHeating
                 }
                 if (turn != Turn.Forward && turn == requested && LeavesPairedBend(b, direction, other, ordinaryChoices))
                     continue;
-                double travel = ray.Available, fallbackDistance = 0;
+                bool onWall = wall >= 0 && direction.Near(tangents[wall]);
+                double travel = onWall ? Min(ray.Available, (edges[wall].End - point).Dot(direction)) : ray.Available;
+                if (onWall && travel < minimum)
+                    continue;
+                double fallbackDistance = 0;
                 Turn? fallback = null;
                 bool chosen = false;
-                foreach (double at in Checkpoints(point, direction, travel, other))
+                foreach (double at in onWall ? Enumerable.Empty<double>() : Checkpoints(point, direction, travel, other))
                 {
                     var sample = point + direction * at;
                     var trial = new List<Segment2>(b.Segments) { new Segment2(point, sample) };

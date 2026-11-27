@@ -98,6 +98,7 @@ namespace Redomine.FloorHeating
         // For ranking completed routes on the same contour. Each edge is kept
         // separately so a gain along one wall cannot hide a loss along another.
         internal double[] BoundaryLengthsMm { get; set; } = Array.Empty<double>();
+        internal double? OuterPassMm { get; set; }
         internal double StripWidthMm { get; set; }
         public double WorkingAreaMm2
         {

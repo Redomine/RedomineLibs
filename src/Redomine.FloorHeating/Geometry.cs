@@ -80,6 +80,12 @@ namespace Redomine.FloorHeating
             var corners = Enumerable.Range(0, polygon.Length).Where(i =>
                 new Segment2(polygon[(i + polygon.Length - 1) % polygon.Length], polygon[i]).Horizontal !=
                 new Segment2(polygon[i], polygon[(i + 1) % polygon.Length]).Horizontal).Select(i => polygon[i]).ToArray();
+            if (offset == 0)
+            {
+                if (corners.Length != polygon.Length)
+                    ValidateLoop(corners);
+                return corners;
+            }
             double winding = Sign(SignedArea(corners));
             var edges = Segments(corners, true).ToArray();
             var working = new Point2[edges.Length];
@@ -158,11 +164,21 @@ namespace Redomine.FloorHeating
         {
             var middle = (a + b) * 0.5;
             var right = normal.Right;
-            double depth = Boundary(middle, -normal, polygon);
-            if (depth <= Tol && !Segments(polygon, true).Any(e => On(middle, e)))
-                throw new ArgumentException("entry_boundary_not_found");
-            var center = middle - normal * depth;
+            var center = Entry(middle, normal, 0, polygon);
             double l = Boundary(center, -right, polygon), r = Boundary(center, right, polygon), required = offset + spacing / 2;
+            int vertex = Array.FindIndex(polygon, p => p.Near(center));
+            if (vertex >= 0)
+            {
+                // A ray past the end of this wall can hit a different arm.
+                // Only the edges incident to the vertex provide room for inlets.
+                int count = polygon.Length;
+                double previous = (polygon[(vertex + count - 1) % count] - center).Dot(right);
+                double next = (polygon[(vertex + 1) % count] - center).Dot(right);
+                if (Min(previous, next) >= -Tol)
+                    l = 0;
+                if (Max(previous, next) <= Tol)
+                    r = 0;
+            }
             if (l + r < 2 * required - Tol)
                 throw new ArgumentException("not_enough_room_for_inlets");
             double shift = Max(required - l, 0);

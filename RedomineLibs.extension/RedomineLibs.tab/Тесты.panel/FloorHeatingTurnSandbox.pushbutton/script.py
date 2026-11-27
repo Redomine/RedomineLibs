@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
-import io
-import json
 import math
 import time
 import os
 import sys
 import uuid
+from contextlib import contextmanager
 
 import clr
 clr.AddReference("dosymep.Revit.dll")
@@ -15,13 +14,11 @@ import dosymep
 clr.ImportExtensions(dosymep.Revit)
 
 from Autodesk.Revit.UI.Selection import ObjectType
-from Autodesk.Revit.Exceptions import OperationCanceledException
+from Autodesk.Revit.Exceptions import OperationCanceledException, RegenerationFailedException
 from pyrevit import DB, forms, script
 
 
 MM_PER_FOOT = 304.8
-ROOT = os.path.join(os.environ["LOCALAPPDATA"], "RvtMcp",
-                    "floor-heating-turn-sandbox")
 SETTINGS_SECTION = "FloorHeatingTurnSandbox"
 ROUTE_MODES = ("spiral_contour_clockwise", "spiral_contour_counterclockwise",
                "serpentine_left_to_right", "serpentine_right_to_left",
@@ -32,8 +29,9 @@ if COMMAND_DIR not in sys.path:
     sys.path.insert(0, COMMAND_DIR)
 from route_timing import RouteProfile, timing_scope
 from route_coverage import measure_coverage
-from build_progress import BuildProgress, BuildCancelled, checkpoint, report_stage
-from floor_heating_pair import classify_open_ends
+from build_progress import BuildProgress, BuildCancelled, MODEL_START, checkpoint, report_stage
+from run_journal import RunJournal, batch_journals
+from floor_heating_pair import classify_open_ends, spiral_inlets
 from vector_walk import (arrowhead_segments,
                          calculate_start_points, limit_route_length,
                          start_at_calculated_entries)
@@ -116,9 +114,15 @@ def _point(world, view):
             relative.DotProduct(view.UpDirection) * MM_PER_FOOT)
 
 
-def _world(point, view):
-    return (view.Origin + view.RightDirection.Multiply(point[0] / MM_PER_FOOT) +
-            view.UpDirection.Multiply(point[1] / MM_PER_FOOT))
+def _world(point, view, elevation=None):
+    on_view = (view.Origin + view.RightDirection.Multiply(point[0] / MM_PER_FOOT) +
+               view.UpDirection.Multiply(point[1] / MM_PER_FOOT))
+    if elevation is None:
+        return on_view
+    normal = view.ViewDirection
+    if abs(normal.Z) <= 1e-9:
+        raise ValueError(u"На вертикальном виде нельзя перенести плоскую улитку на отметку подвода.")
+    return on_view + normal.Multiply((elevation - on_view.Z) / normal.Z)
 
 
 def _choose_regions(uidoc):
@@ -164,11 +168,13 @@ def _polygon(region, view):
     return vertices
 
 
-def _free_end_candidates(document, view):
+def _free_end_candidates(document, view, view_only=False):
+    from spiral_pipes import route_schema
     result = []
-    collector = (DB.FilteredElementCollector(document)
-                 .OfCategory(DB.BuiltInCategory.OST_PipeCurves)
-                 .WhereElementIsNotElementType())
+    schema = route_schema()
+    collector = (DB.FilteredElementCollector(document, view.Id) if view_only
+                 else DB.FilteredElementCollector(document))
+    collector = collector.OfCategory(DB.BuiltInCategory.OST_PipeCurves).WhereElementIsNotElementType()
     for pipe in collector:
         checkpoint()
         manager = getattr(pipe, "ConnectorManager", None)
@@ -176,59 +182,74 @@ def _free_end_candidates(document, view):
             continue
         connectors = [connector for connector in manager.Connectors
                       if connector.ConnectorType == DB.ConnectorType.End]
-        for connector in connectors:
-            if connector.ConnectorType != DB.ConnectorType.End or connector.IsConnected:
-                continue
-            point = _point(connector.Origin, view)
-            result.append((pipe, connectors, connector, point))
+        free = [(i, c) for i, c in enumerate(connectors) if not c.IsConnected]
+        if not free or (schema is not None and pipe.GetEntity(schema).IsValid()):
+            continue
+        for i, connector in free:
+            origin = connector.Origin
+            point = _point(origin, view)
+            vector = None
+            if len(connectors) == 2:
+                other = _point(connectors[1 - i].Origin, view)
+                vector = (point[0] - other[0], point[1] - other[1])
+            result.append({"pipe_id": pipe.Id.GetIdValue(), "element_id": pipe.Id, "point": point,
+                           "direction_vector": vector, "elevation_ft": origin.Z})
     return result
 
 
-def _free_ends(document, view, polygon, cache=None):
-    # Scoped to one command: detail curves do not change pipe connections.
+def _free_ends(document, view, polygon, cache=None, spiral=False):
+    # Snapshot the original inputs once. A later region must not see newly placed pipes.
     if cache is None:
-        candidates = _free_end_candidates(document, view)
+        candidates = _free_end_candidates(document, view, spiral)
     else:
-        if "free_ends" not in cache:
-            cache["free_ends"] = _free_end_candidates(document, view)
-        candidates = cache["free_ends"]
+        key = "view_free_ends" if spiral else "free_ends"
+        if key not in cache:
+            cache[key] = _free_end_candidates(document, view, spiral)
+        candidates = cache[key]
     result = []
-    for pipe, connectors, connector, point in candidates:
-        if _inside(point, polygon):
-            if len(connectors) != 2:
+    for end in candidates:
+        if _inside(end["point"], polygon):
+            if end["direction_vector"] is None:
+                if spiral:
+                    continue
                 raise ValueError("У трубы {0} ожидается два концевых соединителя".format(
-                    pipe.Id.GetIdValue()))
-            other = connectors[0] if connectors[1] == connector else connectors[1]
-            other_point = _point(other.Origin, view)
-            vector = (point[0] - other_point[0], point[1] - other_point[1])
-            result.append({"pipe_id": pipe.Id.GetIdValue(), "point": point,
-                           "direction_vector": vector})
+                    end["pipe_id"]))
+            result.append(end)
+    if spiral:
+        return spiral_inlets(result, polygon, cache.get("selected_ids", ()) if cache else ())
     return result
 
 
-def _write_log(data):
-    if not os.path.isdir(ROOT):
-        os.makedirs(ROOT)
-    path = os.path.join(ROOT, "run-{0}.json".format(data["run_id"]))
-    with io.open(path, "w", encoding="utf-8") as stream:
-        json.dump(data, stream, ensure_ascii=False, indent=2, sort_keys=True)
-    return path
+class _RollbackFailed(RuntimeError):
+    pass
 
 
-def _write_failure_log(run_id, region_id, settings, error):
-    path = os.path.join(ROOT, "run-{0}.json".format(run_id))
-    data = {"run_id": run_id, "region_id": region_id,
-            "settings": settings}
-    if os.path.isfile(path):
-        with io.open(path, "r", encoding="utf-8") as stream:
-            data = json.load(stream)
-    data["error"] = unicode(error)
-    _write_log(data)
+@contextmanager
+def _model_edit(transaction):
+    with transaction:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise RuntimeError(u"Revit не начал транзакцию построения.")
+        try:
+            if isinstance(transaction, DB.Transaction):
+                options = transaction.GetFailureHandlingOptions()
+                transaction.SetFailureHandlingOptions(options.SetForcedModalHandling(True))
+            yield
+            status = transaction.Commit()
+            if status != DB.TransactionStatus.Committed:
+                raise RuntimeError(u"Revit не сохранил изменения. Состояние транзакции — {0}.".format(status))
+        finally:
+            if transaction.GetStatus() == DB.TransactionStatus.Started:
+                try:
+                    status = transaction.RollBack()
+                except Exception as error:
+                    raise _RollbackFailed(u"Не удалось откатить изменения. {0}".format(error))
+                if status != DB.TransactionStatus.RolledBack:
+                    raise _RollbackFailed(u"Revit не подтвердил откат изменений ({0}).".format(status))
 
 
 def _draw(document, view, branches, join, abandoned_segments,
           abandoned_events, first_side, spacing_mm, min_segment_mm,
-          show_abandoned):
+          show_abandoned, pipe_ends=None, region_id=None, max_length_m=None):
     checkpoint()
     ids = {"right": [], "left": [], "bridge": [],
            "abandoned": [], "abandoned_arrows": []}
@@ -244,9 +265,10 @@ def _draw(document, view, branches, join, abandoned_segments,
             overrides[side].append(setting)
     if len(abandoned_segments) != len(abandoned_events):
         raise ValueError("abandoned_segment_journal_mismatch")
-    transaction = DB.Transaction(document, "Теплый пол: диагностический фрагмент")
-    transaction.Start()
-    try:
+    pipe_ids, fitting_ids = None, None
+    title = u"Тёплый пол — трубы и фитинги" if pipe_ends is not None else u"Теплый пол: диагностический фрагмент"
+    edit = DB.SubTransaction(document) if document.IsModifiable else DB.Transaction(document, title)
+    with _model_edit(edit):
         if show_abandoned:
             for (first, second), event in zip(abandoned_segments,
                                               abandoned_events):
@@ -265,39 +287,40 @@ def _draw(document, view, branches, join, abandoned_segments,
                     view.SetElementOverrides(arrow.Id, test_override)
                     arrow_ids.append(arrow.Id.GetIdValue())
                 ids["abandoned_arrows"].append(arrow_ids)
-        for side in ("right", "left"):
-            vertices = branches[side]["vertices"]
-            for first, second in zip(vertices, vertices[1:]):
-                checkpoint()
-                if abs(first[0] - second[0]) <= 0.001 and abs(first[1] - second[1]) <= 0.001:
-                    continue
+        if pipe_ends is not None:
+            from spiral_pipes import build_pipes
+            pipe_ids, fitting_ids = build_pipes(document, region_id, branches, join, pipe_ends, first_side,
+                                                lambda point, z: _world(point, view, z), max_length_m)
+        else:
+            for side in ("right", "left"):
+                vertices = branches[side]["vertices"]
+                for first, second in zip(vertices, vertices[1:]):
+                    checkpoint()
+                    if abs(first[0] - second[0]) <= 0.001 and abs(first[1] - second[1]) <= 0.001:
+                        continue
+                    line = DB.Line.CreateBound(_world(first, view), _world(second, view))
+                    detail = document.Create.NewDetailCurve(view, line)
+                    view.SetElementOverrides(detail.Id, overrides[side][0])
+                    ids[side].append(detail.Id.GetIdValue())
+            if join["connected"] and join["bridge"] is not None:
+                first, second = join["bridge"]
                 line = DB.Line.CreateBound(_world(first, view), _world(second, view))
                 detail = document.Create.NewDetailCurve(view, line)
-                view.SetElementOverrides(detail.Id, overrides[side][0])
-                ids[side].append(detail.Id.GetIdValue())
-        if join["connected"] and join["bridge"] is not None:
-            first, second = join["bridge"]
-            line = DB.Line.CreateBound(_world(first, view), _world(second, view))
-            detail = document.Create.NewDetailCurve(view, line)
-            view.SetElementOverrides(detail.Id, overrides[first_side][0])
-            ids["bridge"].append(detail.Id.GetIdValue())
+                view.SetElementOverrides(detail.Id, overrides[first_side][0])
+                ids["bridge"].append(detail.Id.GetIdValue())
         checkpoint()
-        if transaction.Commit() != DB.TransactionStatus.Committed:
-            raise RuntimeError("Транзакция построения не завершилась")
-    except Exception:
-        if transaction.HasStarted():
-            transaction.RollBack()
-        raise
-    return ids
+    return ids, pipe_ids, fitting_ids
 
 
 def _build_region(document, view, region, selection_method, settings, run_id,
-                  input_cache=None):
+                  input_cache=None, journal=None):
     started = time.time()
+    if journal is None:
+        journal = RunJournal(document, run_id, region.Id.GetIdValue(), settings)
     clockwise = settings["clockwise"]
     limit = settings["max_turns"]
     polygon = _polygon(region, view)
-    ends = _free_ends(document, view, polygon, input_cache)
+    ends = _free_ends(document, view, polygon, input_cache, settings["algorithm"] == "spiral")
     if len(ends) != 2:
         raise ValueError("В области требуется ровно два свободных конца труб; найдено: {0}".format(len(ends)))
     right_end, left_end, direction, separation = classify_open_ends(ends)
@@ -306,7 +329,13 @@ def _build_region(document, view, region, selection_method, settings, run_id,
             polygon, right_end["point"], left_end["point"], direction,
             settings["offset_mm"], settings["spacing_mm"])
     minimum_curve_mm = document.Application.ShortCurveTolerance * MM_PER_FOOT
+    pipe_ends = None
+    if settings["algorithm"] == "spiral":
+        from spiral_pipes import MIN_PIPE_MM
+        minimum_curve_mm = max(minimum_curve_mm, MIN_PIPE_MM)
+        pipe_ends = {"right": right_end, "left": left_end}
     prepared = time.time()
+    report_stage(u"Расчёт маршрута", 0.0)
     with RouteProfile() as route_profile:
         if settings["algorithm"] == "single_serpentine":
             with timing_scope("build_single_serpentine_route"):
@@ -326,7 +355,7 @@ def _build_region(document, view, region, selection_method, settings, run_id,
         else:
             from spiral_native import calculate_spiral
             def spiral_progress(policy, index):
-                report_stage(u"Расчёт улитки: вариант {0}/3".format(index), (index-1)/3.0)
+                report_stage(u"Расчёт улитки, вариант {0}/3".format(index), MODEL_START * (index - 1) / 3.0)
             with timing_scope("spiral_csharp"):
                 route, starts = calculate_spiral(polygon, right_end["point"], left_end["point"],
                                                  direction, settings, minimum_curve_mm, spiral_progress)
@@ -363,27 +392,31 @@ def _build_region(document, view, region, selection_method, settings, run_id,
                                            "bridge": [], "abandoned": [],
                                            "abandoned_arrows": []}}
     data["route_profile"] = route_profile.report()
+    if pipe_ends is not None:
+        data["pipe_ids"] = {"right": [], "left": [], "bridge": []}
+        data["fitting_ids"] = []
+        data["inlet_elevations_mm"] = {side: end["elevation_ft"] * MM_PER_FOOT for side, end in pipe_ends.items()}
     data["timings_seconds"] = {"prepare": prepared - started,
                                "route": calculated - prepared}
     checkpoint()
-    if settings["save_journal"]:
-        _write_log(data)
+    journal.save(data)
     test_events = [event for event in route["journal"] if
                    event["action"] == "abandoned_segment"]
-    report_stage(u"Отрисовка")
+    report_stage(u"Построение труб" if pipe_ends is not None else u"Отрисовка", MODEL_START)
     draw_started = time.time()
-    data["line_ids"] = _draw(document, view, route["branches"],
-                             route["join"], route["abandoned_segments"],
-                             test_events, first_side, settings["spacing_mm"],
-                             minimum_curve_mm, settings["show_abandoned"])
+    lines, pipes, fittings = _draw(document, view, route["branches"], route["join"], route["abandoned_segments"],
+                                   test_events, first_side, settings["spacing_mm"], minimum_curve_mm,
+                                   settings["show_abandoned"], pipe_ends, region.Id, settings["max_length_m"])
+    data["line_ids"] = lines
+    if pipe_ends is not None:
+        data["pipe_ids"], data["fitting_ids"] = pipes, fittings
     data["timings_seconds"]["draw"] = time.time() - draw_started
     for event, element_id, arrow_ids in zip(
             test_events, data["line_ids"]["abandoned"],
             data["line_ids"]["abandoned_arrows"]):
         event["element_id"] = element_id
         event["arrow_element_ids"] = arrow_ids
-    if settings["save_journal"]:
-        _write_log(data)
+    journal.save(data, final=True)
     return data
 
 
@@ -396,39 +429,54 @@ def main():
     if window.result is None:
         return
     settings = window.result
+    input_cache = {}
+    if settings["algorithm"] == "spiral":
+        input_cache["selected_ids"] = set(identifier.GetIdValue() for identifier in uidoc.Selection.GetElementIds())
     regions, selection_method = _choose_regions(uidoc)
     if not regions:
         return
     successes = []
     failures = []
+    journal_errors = []
     limited = []
     timed_out = []
     cancelled = False
-    input_cache = {}
-    with BuildProgress(len(regions)) as progress:
-        for index, region in enumerate(regions):
-            identifier = region.Id.GetIdValue()
-            run_id = str(uuid.uuid4())
-            try:
-                progress.region(u"Область {0}/{1}: {2}".format(index+1, len(regions), identifier))
-                data = _build_region(document, view, region, selection_method,
-                                     settings, run_id, input_cache)
-                route = data["route"]
-                if settings["algorithm"] != "spiral" or route["join"]["connected"]:
-                    successes.append(identifier)
-                if route["length_limit_hit"]:
-                    limited.append(identifier)
-                if route.get("time_limit_hit"):
-                    timed_out.append(identifier)
-            except BuildCancelled:
-                cancelled = True
-                break
-            except Exception as error:
-                failures.append((identifier, unicode(error)))
-                if settings["save_journal"]:
-                    _write_failure_log(run_id, identifier, settings, error)
+    with forms.ProgressBar(title=u"Тёплый пол [{value}%]", cancellable=True) as bar, \
+            BuildProgress(len(regions), bar, __revit__.MainWindowHandle) as progress:
+        batch = DB.Transaction(document, u"Тёплый пол — построение контуров")
+        with batch_journals(journal_errors) as pending, _model_edit(batch):
+            for index, region in enumerate(regions):
+                identifier = region.Id.GetIdValue()
+                run_id = str(uuid.uuid4())
+                journal = RunJournal(document, run_id, identifier, settings, pending)
+                try:
+                    progress.region(u"Область {0}/{1}: {2}".format(index+1, len(regions), identifier))
+                    data = _build_region(document, view, region, selection_method,
+                                         settings, run_id, input_cache, journal)
+                    route = data["route"]
+                    if settings["algorithm"] != "spiral" or route["join"]["connected"]:
+                        successes.append(identifier)
+                    if route["length_limit_hit"]:
+                        limited.append(identifier)
+                    if route.get("time_limit_hit"):
+                        timed_out.append(identifier)
+                except BuildCancelled:
+                    cancelled = True
+                    journal.record_failure(u"Построение отменено пользователем.")
+                except (RegenerationFailedException, _RollbackFailed):
+                    raise  # Further edits are unsafe until the parent transaction is rolled back.
+                except Exception as error:
+                    failures.append((identifier, unicode(error)))
+                    journal.record_failure(error)
+                if journal.write_error:
+                    journal_errors.append((identifier, journal.write_error))
+                if cancelled:
+                    break
+                if index + 1 < len(regions):
+                    progress.finish_region()
+        if not cancelled:
             progress.finish_region()
-    if len(regions) > 1 or failures or limited or timed_out or cancelled:
+    if len(regions) > 1 or failures or journal_errors or limited or timed_out or cancelled:
         lines = [u"Областей: {0}; построено: {1}; ошибок: {2}.".format(
             len(regions), len(successes), len(failures))]
         if cancelled:
@@ -437,10 +485,13 @@ def main():
             lines.append(u"Поиск остановлен по времени: {0}.".format(
                 u", ".join(str(value) for value in timed_out)))
         if limited:
-            lines.append(u"Предел длины достигнут: {0}.".format(
-                u", ".join(str(value) for value in limited)))
+            message = (u"Достигнут предел длины. Построение труб пропущено в областях {0}."
+                       if settings["algorithm"] == "spiral" else u"Предел длины достигнут: {0}.")
+            lines.append(message.format(u", ".join(str(value) for value in limited)))
         for identifier, error in failures:
             lines.append(u"Область {0}: {1}".format(identifier, error))
+        for identifier, error in journal_errors:
+            lines.append(u"Не удалось сохранить журнал области {0}. {1}".format(identifier, error))
         forms.alert(u"\n".join(lines), title=u"Тёплый пол: массовый тест")
 
 

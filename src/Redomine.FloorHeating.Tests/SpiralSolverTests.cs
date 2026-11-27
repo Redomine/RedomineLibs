@@ -20,6 +20,13 @@ namespace Redomine.FloorHeating.Tests
         };
 
         [Fact]
+        public void HostCancellationAtACheckpointStopsTheSearch()
+        {
+            Assert.Throws<OperationCanceledException>(() =>
+                SpiralSolver.Calculate(Room(), null, () => throw new OperationCanceledException()));
+        }
+
+        [Fact]
         public void ClosureRequiresEndpointsOrMatchingBridgeInEitherOrder()
         {
             var right = P(100, 500);
@@ -29,6 +36,89 @@ namespace Redomine.FloorHeating.Tests
             Assert.True(Search.EndsMeet(right, left, new Segment2(right, left)));
             Assert.True(Search.EndsMeet(right, left, new Segment2(left, right)));
             Assert.False(Search.EndsMeet(right, left, new Segment2(P(99, 500), left)));
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        [InlineData(true, true)]
+        public void ZeroOffsetFollowsTheWholeBoundaryUntilTheInletOpening(bool clockwise, bool recessed)
+        {
+            var request = Room();
+            request.OffsetMm = 0;
+            request.Clockwise = clockwise;
+            request.MaximumLengthMm = 160000;
+            // Deliberately choose wall lengths that are not multiples of the
+            // pitch. Turning at a grid checkpoint would miss the actual wall.
+            request.Polygon = recessed
+                ? new[] { P(0, 0), P(4200, 0), P(4200, 2300), P(5600, 2300), P(5600, 4300), P(0, 4300) }
+                : new[] { P(0, 0), P(4100, 0), P(4100, 3300), P(0, 3300) };
+            if (recessed)
+            {
+                request.RightStart = P(80, 1950);
+                request.LeftStart = P(80, 2250);
+                request.EntryDirection = P(1, 0);
+            }
+            var result = SpiralSolver.Calculate(request);
+            Assert.True(result.Connected);
+            Assert.Equal(request.Polygon, result.Contour);
+            var walls = Geometry.Segments(request.Polygon, true).ToArray();
+            var outer = clockwise ? result.Left : result.Right;
+            var pass = Geometry.Segments(outer)
+                .TakeWhile(s => walls.Any(w => Geometry.On(s.Start, w) && Geometry.On(s.End, w))).ToArray();
+            Assert.Equal(walls.Sum(w => w.Length) - 2 * request.SpacingMm, pass.Sum(s => s.Length), 6);
+            Assert.All(request.Polygon, corner => Assert.Contains(pass, s => s.End.Near(corner)));
+        }
+
+        [Fact]
+        public void InletsOnARecessedWallStayOnThatWall()
+        {
+            var request = Room();
+            request.Polygon = new[] { P(0, 0), P(5000, 0), P(5000, 4000), P(3000, 4000),
+                                      P(3000, 1000), P(1000, 1000), P(1000, 4000), P(0, 4000) };
+            request.EntryDirection = P(1, 0);
+            request.RightStart = P(3000, 2000);
+            request.LeftStart = P(3000, 2200);
+            request.OffsetMm = 0;
+            var route = SpiralSolver.Calculate(request);
+            Assert.True(route.Connected);
+            Assert.True(route.Right[0].Near(request.RightStart));
+            Assert.True(route.Left[0].Near(request.LeftStart));
+        }
+
+        [Fact]
+        public void EntryCenteredAtAReentrantCornerFitsOnItsActualWall()
+        {
+            var polygon = new[] { P(0, 0), P(5000, 0), P(5000, 4000), P(3000, 4000),
+                                  P(3000, 1000), P(1000, 1000), P(1000, 4000), P(0, 4000) };
+            var starts = Geometry.Starts(P(3100, 900), P(3100, 1100), P(1, 0), polygon, 0, 200);
+            Assert.True(starts.right.Near(P(3000, 1000)));
+            Assert.True(starts.left.Near(P(3000, 1200)));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void OuterTurnAtAReentrantEntryKeepsRoomForBothElbows(bool mirrored)
+        {
+            Point2 WallPoint(double x, double y) => P(x, mirrored ? -y : y);
+            var request = Room();
+            request.Polygon = new[] { WallPoint(0, 0), WallPoint(5000, 0), WallPoint(5000, 4000), WallPoint(3000, 4000),
+                                      WallPoint(3000, 1000), WallPoint(1000, 1000), WallPoint(1000, 4000), WallPoint(0, 4000) };
+            request.Clockwise = mirrored;
+            request.EntryDirection = P(1, 0);
+            request.RightStart = WallPoint(3100, mirrored ? 1100 : 900);
+            request.LeftStart = WallPoint(3100, mirrored ? 900 : 1100);
+            request.OffsetMm = 0;
+            var route = SpiralSolver.Calculate(request);
+            Assert.True(route.Connected);
+            var outer = mirrored ? route.Left : route.Right;
+            var walls = Geometry.Segments(request.Polygon, true).ToArray();
+            var pass = Geometry.Segments(outer)
+                .TakeWhile(s => walls.Any(w => Geometry.On(s.Start, w) && Geometry.On(s.End, w))).ToArray();
+            Assert.True(outer[0].Near(WallPoint(3000, 1000 + request.SpacingMm)));
+            Assert.Equal(walls.Sum(w => w.Length) - 2 * request.SpacingMm, pass.Sum(s => s.Length), 6);
         }
 
         [Theory]

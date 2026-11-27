@@ -43,6 +43,23 @@ namespace Redomine.FloorHeating
             var ordered = (SignedArea(contour) < 0) == clockwise ? contour : contour.Reverse().ToArray();
             edges = Segments(ordered, true).ToArray();
             tangents = edges.Select(s => s.Unit).ToArray();
+            if (offset == 0)
+            {
+                var outer = clockwise ? leftStart : rightStart;
+                int wall = OutgoingEdge(outer);
+                if (wall >= 0 && outer.Near(edges[wall].Start) && tangents[wall].Near(-normal))
+                {
+                    // At this reflex corner the first turn would double back along
+                    // the inlet. Leave one pitch for the two elbows on the entry wall.
+                    int entry = (wall + edges.Length - 1) % edges.Length;
+                    var shift = -tangents[entry] * spacing;
+                    if (On(rightStart + shift, edges[entry]) && On(leftStart + shift, edges[entry]))
+                    {
+                        rightStart += shift;
+                        leftStart += shift;
+                    }
+                }
+            }
             reflexEdges = Enumerable.Range(0, edges.Length).Where(i =>
                 (clockwise ? 1 : -1) * tangents[i].Cross(tangents[Next(i)]) > Tol).ToArray();
             edgeLengths = edges.Select(s => s.Length).ToArray();
@@ -51,6 +68,9 @@ namespace Redomine.FloorHeating
                 phases[i] = phases[i - 1] + edgeLengths[i - 1];
         }
         private int Next(int edge) => (edge + 1) % edges.Length;
+        // At a vertex the perimeter continues along the outgoing edge.
+        private int OutgoingEdge(Point2 point) =>
+            Array.FindIndex(edges, edge => On(point, edge) && !edge.End.Near(point));
         private Anchor OnEdge(Point2 p, int i)
         {
             double along = Clamp((p - edges[i].Start).Dot(tangents[i]), 0, edgeLengths[i]);
