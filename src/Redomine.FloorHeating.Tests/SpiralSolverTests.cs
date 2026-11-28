@@ -291,6 +291,50 @@ namespace Redomine.FloorHeating.Tests
         }
 
         [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void RecoveryKeepsTheReturnPassInAProjectionWithInlets(bool sideEntry, bool mirrored)
+        {
+            const double pitch = 165, width = 23.5, shoulder = 17.5, left = 7.5, right = 13.5, top = 24;
+            Point2 InView(double x, double y)
+            {
+                // Orthogonal plan in a view with a sub-tolerance rotation.
+                const double skew = 3e-14;
+                var u = (x - y * skew) * pitch;
+                var v = (y + x * skew) * pitch;
+                return mirrored ? P(-12345 + v, 70310 + u) : P(-12345 + u, 70310 + v);
+            }
+            var outward = mirrored ? P(1, 0) : P(0, 1);
+            var across = mirrored ? P(0, 1) : P(1, 0);
+            var a = sideEntry ? InView(left + 0.35, shoulder + 2.15) : InView(left + 2.65, top - 0.35);
+            var b = sideEntry ? InView(left + 0.35, shoulder + 3.65) : InView(left + 4.15, top - 0.35);
+            var route = SpiralSolver.Calculate(new SpiralRequest
+            {
+                Polygon = new[] { InView(0, shoulder), InView(left, shoulder), InView(left, top), InView(right, top),
+                                  InView(right, shoulder), InView(width, shoulder), InView(width, 0), InView(0, 0) },
+                RightStart = mirrored ? b : a, LeftStart = mirrored ? a : b,
+                Clockwise = mirrored, EntryDirection = sideEntry ? across : -outward,
+                SpacingMm = pitch, OffsetMm = pitch, MinimumSegmentMm = 0.8, MaximumLengthMm = 130000
+            });
+
+            Assert.True(route.Connected);
+            Assert.True(Search.EndsMeet(route.Right.Last(), route.Left.Last(), route.Bridge));
+            var mouth = new Segment2(InView(left + 1, shoulder - 1), InView(right - 1, shoulder - 1));
+            // A top inlet occupies the first two lanes next to the end wall.
+            var reach = InView(right - 1, top - (sideEntry ? 1 : 3));
+            var outer = Geometry.Segments(mirrored ? route.Left : route.Right).ToArray();
+            int pass = Array.FindIndex(outer, s => s.Start.Near(mouth.End) && s.Unit.Near(outward) && Geometry.On(reach, s));
+            Assert.True(pass >= 0, "The outer branch must enter the projection from the main room.");
+            Assert.Contains(outer.Skip(pass + 1), s => s.Unit.Near(-outward) && Geometry.Clearance(s, mouth) <= Geometry.Tol &&
+                (s.End - mouth.Start).Dot(outward) < -Geometry.Tol);
+            var center = InView(width / 2, shoulder / 2);
+            foreach (var branch in new[] { route.Left, route.Right })
+                Assert.Contains(Geometry.Segments(branch), s => Geometry.Clearance(s, new Segment2(center, center)) <= 2 * pitch + Geometry.Tol);
+        }
+
+        [Theory]
         [InlineData(false)]
         [InlineData(true)]
         public void StaggeredBranchesTakeTheSameFreeInteriorBend(bool mirrored)

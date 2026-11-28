@@ -182,6 +182,8 @@ namespace Redomine.FloorHeating
                     return false;
                 if (pocket)
                 {
+                    if (OnBoundaryEdge(s[1]) || OnBoundaryEdge(s[2]))
+                        return false;
                     int axis = s[1].Horizontal ? 0 : 1;
                     foreach (var other in partner.Segments)
                     {

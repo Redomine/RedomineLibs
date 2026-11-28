@@ -213,9 +213,9 @@ namespace Redomine.FloorHeating
                             var a = sampleAnchor.Value;
                             var target = sample + side.Vector * Min(spacing, nextRay.Available);
                             var p = Project(target, a, spacing);
-                            bool corner = side.Vector.Equals(tangents[Next(a.Edge)]) && a.Distance <= 2 * spacing + Tol &&
+                            bool corner = side.Vector.Near(tangents[Next(a.Edge)]) && a.Distance <= 2 * spacing + Tol &&
                                         Project(sample, a, 0, true).Phase <= a.Phase + Tol;
-                            obstacleReturn = turn != Turn.Forward && side.Vector.Equals(b.Heading) && IsPipe(b.LastBlocker);
+                            obstacleReturn = turn != Turn.Forward && side.Vector.Near(b.Heading) && IsPipe(b.LastBlocker);
                             if (!obstacleReturn && p.Backward)
                                 continue;
                             phaseFallback = !obstacleReturn && !corner;

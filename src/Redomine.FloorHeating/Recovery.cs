@@ -62,7 +62,7 @@ namespace Redomine.FloorHeating
             if (extra && reserve.HasValue && leader.Guided && !leader.Pending.HasValue)
                 foreach (var d in Directions(leader))
                 {
-                    if (d.Turn == Turn.Forward || d.Vector.Equals(reserve.Value.Unit))
+                    if (d.Turn == Turn.Forward || d.Vector.Near(reserve.Value.Unit))
                         continue;
                     var ray = Probe(leader.Tip, d.Vector, leader.Segments, partner);
                     if (CanTravel(ray))

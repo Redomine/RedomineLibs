@@ -101,9 +101,10 @@ namespace Redomine.FloorHeating
                 alternatePreview = shown;
                 alternateRecovery = candidate.Clone();
             }
+            // An unmatched turn may still supply a wall pass for a paired circuit.
+            KeepOuterPass(shown);
             if (guardHeading && !PairedHeading(shown))
                 return;
-            KeepOuterPass(shown);
             if (!Better(shown, policyFinish))
                 return;
             policyFinish = Display(candidate);
@@ -117,9 +118,11 @@ namespace Redomine.FloorHeating
         }
         private SpiralRoute ConsiderFinish(SpiralRoute current, SpiralRoute proposed)
         {
-            if (proposed == null || (guardHeading && !PairedHeading(proposed)))
+            if (proposed == null)
                 return current;
             KeepOuterPass(proposed);
+            if (guardHeading && !PairedHeading(proposed))
+                return current;
             SaveForTimeout(proposed);
             var result = Better(proposed, current) ? RestoreBoundary(proposed, current) : RestoreBoundary(current, proposed);
             SaveForTimeout(result);
@@ -163,7 +166,16 @@ namespace Redomine.FloorHeating
                             metrics.Reason = candidate?.Join == null ? "no_valid_orthogonal_join" : "invalid_visible_geometry";
                         continue;
                     }
-                    result = RestoreBoundary(result, best);
+                    // A later policy can supply a missing wall pass even when
+                    // an earlier one already covers more of the interior.
+                    var combined = RestoreBoundary(best, result);
+                    if (combined != best)
+                    {
+                        SaveForTimeout(combined);
+                        result = combined;
+                    }
+                    else
+                        result = RestoreBoundary(result, best);
                     if (result.Connected && outerPasses.TryGetValue((result.Right[0], result.Left[0]), out var outer))
                         result = RestoreBoundary(result, outer);
                     metrics.Record(result);

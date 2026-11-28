@@ -68,6 +68,8 @@ namespace Redomine.FloorHeating
                 phases[i] = phases[i - 1] + edgeLengths[i - 1];
         }
         private int Next(int edge) => (edge + 1) % edges.Length;
+        private bool OnBoundaryEdge(Segment2 segment) =>
+            edges.Any(edge => On(segment.Start, edge) && On(segment.End, edge));
         // At a vertex the perimeter continues along the outgoing edge.
         private int OutgoingEdge(Point2 point) =>
             Array.FindIndex(edges, edge => On(point, edge) && !edge.End.Near(point));
@@ -171,7 +173,7 @@ namespace Redomine.FloorHeating
                     continue;
                 }
                 double progress = p.Phase - a.Phase;
-                int priority = atCorner && d.Vector.Equals(tangents[Next(a.Edge)]) ? 0 : progress > Tol ? 1 : 2;
+                int priority = atCorner && d.Vector.Near(tangents[Next(a.Edge)]) ? 0 : progress > Tol ? 1 : 2;
                 ranked.Add((priority, -progress, i, d));
             }
             var result = ranked.OrderBy(x => x.priority).ThenBy(x => x.progress).ThenBy(x => x.order).Select(x => x.d).ToList();

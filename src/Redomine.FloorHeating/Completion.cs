@@ -120,53 +120,95 @@ namespace Redomine.FloorHeating
                 var inward = Inward(s.Unit);
                 if (!next.Unit.Near(-inward))
                     continue;
+                var cap = i + 2 < f.Count ? new Segment2(f[i + 1], f[i + 2]) : default;
+                bool wallPass = cap.Length > minimum && cap.Unit.Near(s.Unit) && OnBoundaryEdge(next);
                 for (int j = 2; j < g.Count; j++)
                 {
                     var partner = new Segment2(g[j - 1], g[j]);
                     if (partner.Length <= minimum || !s.Unit.Near(partner.Unit) || Abs((partner.Start - s.End).Dot(inward) - spacing) > Tol)
                         continue;
                     var end = s.End - s.Unit * spacing + inward * spacing;
-                    if (!On(end, partner))
-                        continue;
-                    var prefix = original.Clone();
-                    prefix[first].SetPath(f.Take(i + 1).ToList());
-                    prefix[second].SetPath(g.Take(j).Concat(new[] { end }).ToList());
-                    var forward = Probe(s.End, s.Unit, prefix[first].Segments, Obstacles(prefix[second]));
-                    if (forward.Kind == Blocker.Boundary || forward.Available > 2 * spacing + Tol)
-                        continue;
-                    double available = Min(Available(prefix, first, inward), Available(prefix, second, inward));
-                    var required = BoundaryCoverage(prefix);
-                    for (int step = 1; step * spacing <= available + Tol; step++)
+                    // Pair the follower with the return lane of the wall pass.
+                    // Try cutting at the mouth only if that pass cannot continue.
+                    if (!wallPass || !TryFrom(end + cap.Delta, next.Length))
+                        TryFrom(end, 0);
+                    if (budget.Remaining <= 0)
+                        return best;
+
+                    bool TryFrom(Point2 followerEnd, double returnDepth)
                     {
-                        if (!budget.Take())
-                            return best;
-                        var t = prefix.Clone();
-                        foreach (var b in new[] { t.Right, t.Left })
+                        if (!On(followerEnd, partner))
+                            return false;
+                        var prefix = original.Clone();
+                        prefix[first].SetPath(f.Take(i + 1).ToList());
+                        prefix[second].SetPath(g.Take(j).ToList());
+                        if (!prefix[second].Tip.Near(followerEnd))
+                            prefix[second].Append(followerEnd);
+                        var forward = Probe(s.End, s.Unit, prefix[first].Segments, Obstacles(prefix[second]));
+                        if (forward.Kind == Blocker.Boundary || forward.Available > 2 * spacing + Tol)
+                            return false;
+                        if (returnDepth > 0)
                         {
-                            AppendVertex(b, b.Tip + inward * (step * spacing));
-                            b.Heading = inward;
-                            b.Turns = CountTurns(b.Vertices);
-                            b.Pending = b.Only = Ordinary(inward, clockwise).First(x => x.Vector.Near(s.Unit)).Turn;
-                            b.Stop = null;
-                            b.Guided = true;
-                            b.Anchor = Project(b.Tip);
-                            b.Returning = null;
-                            b.Avoid = null;
+                            prefix[first].Append(next.End);
+                            prefix[first].Append(cap.End);
                         }
-                        if (Max(t.Right.Turns, t.Left.Turns) >= maxTurns || !Clear(t.Right.Vertices, t.Left.Vertices, null))
-                            continue;
-                        var candidate = Continue(t, new List<SpiralEvent>(), 1, false, budget);
-                        double length = Length(candidate.Pair, candidate.Join);
-                        if (candidate.Join == null || length <= bestLength + 2 * spacing + Tol ||
-                           !Clear(candidate.Pair.Right.Vertices, candidate.Pair.Left.Vertices, candidate.Join.Bridge) ||
-                           !Preserves(BoundaryCoverage(candidate.Pair), required))
-                            continue;
-                        candidate.Log.InsertRange(0, route.Log);
+                        var candidate = GrowInward(prefix, s.Unit, returnDepth, bestLength, budget, route.Log);
+                        if (candidate == null)
+                            return false;
                         candidate.Log.Add(new SpiralEvent { Action = "inward_bypass_completed" });
                         best = candidate;
-                        bestLength = length;
+                        bestLength = Length(candidate.Pair, candidate.Join);
+                        return true;
                     }
                 }
+            }
+            return best;
+        }
+        private Candidate GrowInward(Pair prefix, Point2 resume, double returnDepth, double bestLength,
+            Budget budget, List<SpiralEvent> history)
+        {
+            var inward = Inward(resume);
+            var turn = Ordinary(inward, clockwise).First(d => d.Vector.Near(resume)).Turn;
+            ProbeResult Ray(int side) => Probe(prefix[side].Tip, inward, prefix[side].Segments, Obstacles(prefix[1 - side]));
+            var leaderRay = Ray(first);
+            var followerRay = Ray(second);
+            double available = Min(leaderRay.Available - returnDepth, followerRay.Available);
+            var required = BoundaryCoverage(prefix);
+            Candidate best = null;
+            for (int step = 1; step * spacing <= available + Tol && budget.Take(); step++)
+            {
+                Branch Advance(int side)
+                {
+                    var source = prefix[side];
+                    double distance = step * spacing + (side == first ? returnDepth : 0);
+                    var ray = side == first ? leaderRay : followerRay;
+                    bool reached = distance >= ray.Available - Tol;
+                    // Reservations and blockers from the discarded tail no longer describe this tip.
+                    var b = new Branch(side, new List<Point2>(source.Vertices), inward)
+                    {
+                        Guided = true, Rebind = source.Rebind, Pending = turn, Only = turn,
+                        LastBlocker = reached ? ray.Kind : Blocker.Intermediate,
+                        LastObstacle = reached ? ray.Obstacle : null
+                    };
+                    b.Append(b.Tip + inward * distance);
+                    b.Anchor = Project(b.Tip);
+                    b.Turns = CountTurns(b.Vertices);
+                    return b;
+                }
+                var pair = new Pair(Advance(0), Advance(1));
+                if (Max(pair.Right.Turns, pair.Left.Turns) >= maxTurns || !Clear(pair.Right.Vertices, pair.Left.Vertices, null))
+                    continue;
+                var candidate = Continue(pair, new List<SpiralEvent>(), 1, false, budget);
+                double length = Length(candidate.Pair, candidate.Join);
+                if (candidate.Join == null || length <= bestLength + 2 * spacing + Tol ||
+                    !Clear(candidate.Pair.Right.Vertices, candidate.Pair.Left.Vertices, candidate.Join.Bridge) ||
+                    !Preserves(BoundaryCoverage(candidate.Pair), required))
+                    continue;
+                candidate.Log.InsertRange(0, history);
+                if (Display(candidate, false)?.Connected != true)
+                    continue;
+                best = candidate;
+                bestLength = length;
             }
             return best;
         }
